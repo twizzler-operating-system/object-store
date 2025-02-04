@@ -4,6 +4,7 @@ mod fs;
 // mod nvme;
 mod object_store;
 mod wrapped_extent;
+mod kms;
 // pub use fs::FS;
 pub use object_store::*;
 #[cfg(test)]
@@ -167,7 +168,7 @@ mod tests {
         let mut working_bufs = (vec![0; 5000], vec![0; 5000]);
         let mut os = OBJECT_STORE.lock().unwrap();
         // println!("{:?}", KHF.lock().unwrap());
-        let out = (0..1)
+        let out = (0..10)
             .map(|_i| make_and_check_file(&os, &mut working_bufs.0, &mut working_bufs.1))
             .collect::<Vec<_>>();
         os.advance_epoch().unwrap();
