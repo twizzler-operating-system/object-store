@@ -12,7 +12,7 @@ fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", b
     "log_level_info",
     "lfn",
     "alloc",
-], default-features = false }
+], default-features = false, public = true }
 rand = "0.8.5"
 async-trait = "0.1.66"
 volatile = "0.5"

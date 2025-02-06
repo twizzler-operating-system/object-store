@@ -1,8 +1,9 @@
-use crate::{
-    fs::{Disk, FileSystem, PAGE_SIZE},
-    kms::Kms,
-    wrapped_extent::WrappedExtent,
+use std::{
+    collections::HashSet,
+    io::Error,
+    sync::{Arc, Mutex, MutexGuard},
 };
+
 use chacha20::{
     cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
     ChaCha20,
@@ -20,10 +21,11 @@ use obliviate_core::{
     wal::SecureWAL,
 };
 use rand::rngs::OsRng;
-use std::{
-    collections::HashSet,
-    io::Error,
-    sync::{Arc, Mutex, MutexGuard},
+
+use crate::{
+    fs::{Disk, FileSystem, PAGE_SIZE},
+    kms::Kms,
+    wrapped_extent::WrappedExtent,
 };
 
 type EncodedObjectId = String;
@@ -282,12 +284,12 @@ where
     fn get_symmetric_cipher(&self, disk_offset: u64) -> Result<ChaCha20, Error> {
         let kms = self.kms();
         let chunk_id = disk_offset_to_id(disk_offset);
-        println!("Chunk id: {}", chunk_id);
+        //println!("Chunk id: {}", chunk_id);
         let key = kms
             .khf_lock()
             .derive_mut(&kms.wal_lock(), chunk_id)
             .map_err(Error::other)?;
-        println!("Key for {}:{:?}", disk_offset, key);
+        //println!("Key for {}:{:?}", disk_offset, key);
         get_symmetric_cipher_from_key(disk_offset, key)
     }
 
@@ -304,7 +306,7 @@ where
              buffer: &mut [u8]|
              -> Result<usize, fatfs::Error<D::Error>> {
                 let out = disk.read(buffer)?;
-                println!("reading @ {}", disk_offset);
+                //println!("reading @ {}", disk_offset);
                 let mut cipher = self
                     .get_symmetric_cipher(disk_offset)
                     .map_err(Error::other)?;
@@ -345,7 +347,7 @@ where
             &mut file,
             || {},
             |disk: &mut D, offset: u64, buffer: &[u8]| -> Result<usize, fatfs::Error<D::Error>> {
-                println!("writing @ {}", offset);
+                //println!("writing @ {}", offset);
                 let mut cipher = self.get_symmetric_cipher(offset)?;
                 let mut encrypted = vec![0u8; buffer.len()];
                 cipher
@@ -372,7 +374,7 @@ where
             .update(&kms.wal_lock())
             .map_err(Error::other)?;
         for (id, key) in updated_keys {
-            println!("{}", id_to_disk_offset(id));
+            //println!("{}", id_to_disk_offset(id));
             let mut buf = vec![0; PAGE_SIZE];
             let mut disk = self.fs.disk().clone();
             let disk_offset = id_to_disk_offset(id);

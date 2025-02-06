@@ -2,15 +2,17 @@
 // mod disk;
 mod fs;
 // mod nvme;
+mod kms;
 mod object_store;
 mod wrapped_extent;
-mod kms;
 // pub use fs::FS;
 pub use object_store::*;
+
+pub mod fat {
+    pub use ::fatfs::*;
+}
 #[cfg(test)]
 mod tests {
-    use fatfs::{IoBase, StdIoWrapper};
-    use object_store::ObjectStore;
     use std::{
         fs::{File, OpenOptions},
         io::{Seek, Write},
@@ -18,6 +20,9 @@ mod tests {
         path::Path,
         sync::{Arc, LazyLock, Mutex, MutexGuard, RwLock},
     };
+
+    use fatfs::{IoBase, StdIoWrapper};
+    use object_store::ObjectStore;
     #[derive(Clone)]
     struct FileDisk {
         disk: Arc<Mutex<StdIoWrapper<File>>>,

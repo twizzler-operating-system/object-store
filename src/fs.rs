@@ -18,6 +18,7 @@ pub const SECTOR_SIZE: usize = 512;
 
 impl<D: Disk> FileSystem<D> {
     pub fn format(disk: &mut D) {
+        println!("reformatting");
         let options = FormatVolumeOptions::new()
             .bytes_per_sector(SECTOR_SIZE as u16)
             .bytes_per_cluster(PAGE_SIZE as u32)
