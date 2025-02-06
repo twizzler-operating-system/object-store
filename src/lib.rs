@@ -1,4 +1,5 @@
 #![feature(iterator_try_collect)]
+#![feature(slice_as_chunks)]
 // mod disk;
 mod fs;
 // mod nvme;

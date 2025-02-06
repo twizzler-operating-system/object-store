@@ -1,6 +1,7 @@
 use std::{
-    collections::HashSet,
-    io::Error,
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    io::{Error, ErrorKind},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -16,7 +17,8 @@ use obliviate_core::{
     crypter::{aes::Aes256Ctr, ivs::SequentialIvg},
     hasher::sha3::{Sha3_256, SHA3_256_MD_SIZE},
     kms::{
-        khf::Khf, KeyManagementScheme, PersistableKeyManagementScheme, StableKeyManagementScheme,
+        khf::Khf, InstrumentedKeyManagementScheme, KeyManagementScheme,
+        PersistableKeyManagementScheme, StableKeyManagementScheme,
     },
     wal::SecureWAL,
 };
@@ -247,7 +249,7 @@ where
             file.extents().collect::<Vec<_>>().into_iter()
         };
         for extent in extents {
-            let id = extent?.offset / crate::fs::PAGE_SIZE as u64;
+            let id = disk_offset_to_id(extent?.offset);
             let kms = self.kms();
 
             kms.khf_lock()
@@ -405,6 +407,78 @@ where
         kms.wal_lock().clear().map_err(Error::other)?;
         Ok(())
     }
+
+    pub fn get_lethe_key_from_offset(&self, offset: u64) -> Result<[u8; 32], Error> {
+        let kms = self.kms();
+        kms.khf_lock()
+            .derive_mut(&kms.wal_lock(), disk_offset_to_id(offset))
+            .map_err(|_| ErrorKind::Other.into())
+    }
+
+    pub fn get_lethe_state(&self) -> Result<LetheState, Error> {
+        let mut objs = Vec::new();
+        for id in self.get_all_object_ids()? {
+            let mut perobj = PerObjLetheState::default();
+            perobj.id = id;
+            let extents = self.get_obj_segments(id)?;
+            for extent in extents {
+                let chunk_id = extent.0.offset / crate::fs::PAGE_SIZE as u64;
+                let kms = self.kms();
+                let key = kms
+                    .khf_lock()
+                    .derive_mut(&kms.wal_lock(), chunk_id)
+                    .map_err(Error::other)?;
+                perobj.keys.insert(extent, key);
+            }
+            objs.push(perobj);
+        }
+        let kms = self.kms();
+        let roots = kms
+            .khf_lock()
+            .roots()
+            .iter()
+            .map(|root| (root.pos.0, root.pos.1, root.key))
+            .collect();
+        Ok(LetheState { list: objs, roots })
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct PerObjLetheState {
+    pub id: u128,
+    pub keys: HashMap<WrappedExtent, [u8; 32]>,
+}
+
+pub fn key_fprint(key: &[u8; 32]) -> u32 {
+    key.as_chunks::<4>()
+        .0
+        .iter()
+        .fold(0, |acc, chunk| acc ^ u32::from_le_bytes(*chunk))
+}
+
+impl Display for PerObjLetheState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "id: {:x} ({} extents)", self.id, self.keys.len())?;
+        let mut keys = self.keys.iter().collect::<Vec<_>>();
+        keys.sort_by(|x, y| x.0 .0.offset.cmp(&y.0 .0.offset));
+        for key in keys.iter().take(4) {
+            writeln!(
+                f,
+                "  -- {} ({}): {:8x}",
+                key.0 .0.offset,
+                disk_offset_to_id(key.0 .0.offset),
+                key_fprint(key.1)
+            )?;
+        }
+        writeln!(f, "  -- ...")?;
+        Ok(())
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct LetheState {
+    pub list: Vec<PerObjLetheState>,
+    pub roots: Vec<(u64, u64, [u8; 32])>,
 }
 
 pub fn disk_offset_to_id(offset: u64) -> u64 {

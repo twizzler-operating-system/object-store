@@ -1,8 +1,9 @@
-use fatfs::Extent;
 use std::hash::Hash;
 
+use fatfs::Extent;
+
 #[derive(Clone, Debug)]
-pub struct WrappedExtent(Extent);
+pub struct WrappedExtent(pub(crate) Extent);
 
 impl PartialEq for WrappedExtent {
     fn eq(&self, other: &Self) -> bool {
