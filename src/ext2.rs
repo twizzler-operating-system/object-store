@@ -1,4 +1,4 @@
-use std::{io::ErrorKind, str::FromStr, sync::Mutex};
+use std::{io::ErrorKind, marker::PhantomData, str::FromStr, sync::Mutex};
 
 use efs::{
     file::{Directory, File, Type},
@@ -13,15 +13,11 @@ use efs::{
 };
 use obliviate_core::consts::PAGE_SIZE;
 
-use crate::paged_object_store::{ObjID, PagedObjectStore};
+use crate::paged_object_store::{ObjID, PageRequest, PagedObjectStore, PagingImp};
 
-struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>> {
+struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> {
     fs: Mutex<Ext2Fs<Device>>,
-}
-
-struct TestPageRequest {
-    phys_page: Box<[u8; 4096]>,
-    page_number: i64,
+    _pd: PhantomData<P>,
 }
 
 fn e2error_to_std(err: efs::error::Error<Ext2Error>) -> std::io::Error {
@@ -56,9 +52,9 @@ fn e2result_to_std<T>(err: Result<T, efs::error::Error<Ext2Error>>) -> Result<T,
     err.map_err(|e| e2error_to_std(e))
 }
 
-impl<Device: efs::dev::Device<u8, Ext2Error>> PagedObjectStore for Ext2ObjectStore<Device> {
-    type PageRequest = TestPageRequest;
-
+impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
+    for Ext2ObjectStore<Device, P>
+{
     fn get_config_id(&self) -> std::io::Result<crate::paged_object_store::ObjID> {
         let mut buf = [0; 16];
         self.read_object(0, 0, &mut buf).and_then(|len| {
@@ -153,14 +149,15 @@ impl<Device: efs::dev::Device<u8, Ext2Error>> PagedObjectStore for Ext2ObjectSto
     fn page_in_object<'a>(
         &self,
         id: crate::paged_object_store::ObjID,
-        reqs: &'a mut [Self::PageRequest],
+        reqs: &'a mut [PageRequest<P>],
     ) -> std::io::Result<usize> {
+        let mut buf = [0; PAGE_SIZE];
         for req in reqs.iter_mut() {
-            self.read_object(
-                id,
-                (req.page_number as usize * PAGE_SIZE) as u64,
-                &mut *req.phys_page,
-            )?;
+            for i in 0..req.nr_pages {
+                let page = req.start_page as usize + i as usize;
+                self.read_object(id, (page * PAGE_SIZE) as u64, &mut buf)?;
+                req.imp.fill_from_buffer(&buf);
+            }
         }
         Ok(reqs.len())
     }
@@ -168,20 +165,21 @@ impl<Device: efs::dev::Device<u8, Ext2Error>> PagedObjectStore for Ext2ObjectSto
     fn page_out_object<'a>(
         &self,
         id: crate::paged_object_store::ObjID,
-        reqs: &'a [Self::PageRequest],
+        reqs: &'a [PageRequest<P>],
     ) -> std::io::Result<usize> {
+        let mut buf = [0; PAGE_SIZE];
         for req in reqs.iter() {
-            self.write_object(
-                id,
-                (req.page_number as usize * PAGE_SIZE) as u64,
-                &*req.phys_page,
-            )?;
+            for i in 0..req.nr_pages {
+                req.imp.read_to_buffer(&mut buf);
+                let page = req.start_page as usize + i as usize;
+                self.write_object(id, (page * PAGE_SIZE) as u64, &buf)?;
+            }
         }
         Ok(reqs.len())
     }
 }
 
-impl<Device: efs::dev::Device<u8, Ext2Error>> Ext2ObjectStore<Device> {
+impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
     pub fn get_id_path(&self, id: ObjID) -> (UnixStr, Path) {
         let top = id.to_be_bytes()[0];
         let us = UnixStr::from_str(&format!("{:x}", top)).unwrap();
@@ -206,7 +204,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>> Ext2ObjectStore<Device> {
     }
 }
 
-impl<Device: efs::dev::Device<u8, Ext2Error>> Ext2ObjectStore<Device> {
+impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
     fn new(fs: Ext2Fs<Device>) -> Self {
         let path = Path::from_str("ids").unwrap();
         let root = fs.root().unwrap();
@@ -221,7 +219,10 @@ impl<Device: efs::dev::Device<u8, Ext2Error>> Ext2ObjectStore<Device> {
             )
             .expect("failed to setup ids directory");
         }
-        Self { fs: Mutex::new(fs) }
+        Self {
+            fs: Mutex::new(fs),
+            _pd: PhantomData,
+        }
     }
 }
 
@@ -240,10 +241,29 @@ mod tests {
     use efs::types::{Gid, Uid};
     use obliviate_core::consts::PAGE_SIZE;
 
-    use crate::paged_object_store::PagedObjectStore;
+    use crate::paged_object_store::{PageRequest, PagedObjectStore, PagingImp};
 
-    use super::{Ext2ObjectStore, TestPageRequest};
+    use super::Ext2ObjectStore;
 
+    struct TestPageRequest {
+        phys_page: Box<[u8; PAGE_SIZE]>,
+    }
+
+    impl PagingImp for TestPageRequest {
+        type PhysAddr = Box<[u8; PAGE_SIZE]>;
+
+        fn fill_from_buffer(&mut self, buf: &[u8]) {
+            self.phys_page.copy_from_slice(buf);
+        }
+
+        fn read_to_buffer(&self, buf: &mut [u8]) {
+            buf.copy_from_slice(&*self.phys_page);
+        }
+
+        fn phys_addr(&self) -> &Self::PhysAddr {
+            &self.phys_page
+        }
+    }
     #[test]
     fn ext2_config_id() {
         let file = File::options()
@@ -252,7 +272,7 @@ mod tests {
             .open("image.ext2")
             .expect("failed to open test image");
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
         let res = os.get_config_id();
         assert_eq!(res.unwrap_err().kind(), ErrorKind::NotFound);
         os.set_config_id(123).unwrap();
@@ -275,29 +295,25 @@ mod tests {
 
         let req = TestPageRequest {
             phys_page: Box::new([3; PAGE_SIZE]),
-            page_number: 8,
         };
         let req2 = TestPageRequest {
             phys_page: Box::new([2; PAGE_SIZE]),
-            page_number: 12,
         };
 
-        let reqs = [req, req2];
+        let reqs = [PageRequest::new(req, 8, 1), PageRequest::new(req2, 12, 1)];
         let count = os.page_out_object(id, &reqs).unwrap();
         assert_eq!(count, 2);
         let rreq = TestPageRequest {
             phys_page: Box::new([0; PAGE_SIZE]),
-            page_number: 8,
         };
         let rreq2 = TestPageRequest {
             phys_page: Box::new([0; PAGE_SIZE]),
-            page_number: 12,
         };
-        let mut rreqs = [rreq, rreq2];
+        let mut rreqs = [PageRequest::new(rreq, 8, 1), PageRequest::new(rreq2, 12, 1)];
         let count = os.page_in_object(id, &mut rreqs).unwrap();
         assert_eq!(count, 2);
-        assert_eq!(rreqs[0].phys_page, reqs[0].phys_page);
-        assert_eq!(rreqs[1].phys_page, reqs[1].phys_page);
+        assert_eq!(rreqs[0].imp.phys_page, reqs[0].imp.phys_page);
+        assert_eq!(rreqs[1].imp.phys_page, reqs[1].imp.phys_page);
     }
 
     #[test]
@@ -308,7 +324,7 @@ mod tests {
             .open("image.ext2")
             .expect("failed to open test image");
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
         let id = rand::random::<u128>();
         os.create_object(id).unwrap();
         let mut buf = [1; 1024];
