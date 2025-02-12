@@ -1,17 +1,20 @@
 #![feature(iterator_try_collect)]
 #![feature(slice_as_chunks)]
 // mod disk;
-mod fs;
+//mod fs;
 // mod nvme;
-mod kms;
-mod object_store;
-mod wrapped_extent;
+//mod kms;
+//mod object_store;
+//mod wrapped_extent;
 // pub use fs::FS;
-pub use object_store::*;
+//pub use object_store::*;
+pub mod ext2;
+pub mod paged_object_store;
 
-pub mod fat {
-    pub use ::fatfs::*;
-}
+//pub mod fat {
+//   pub use ::fatfs::*;
+//}
+/*
 #[cfg(test)]
 mod tests {
     use std::{
@@ -205,3 +208,5 @@ mod tests {
         }
     }
 }
+
+*/
