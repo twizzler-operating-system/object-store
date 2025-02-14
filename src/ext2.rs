@@ -3,7 +3,7 @@ use std::{io::ErrorKind, marker::PhantomData, str::FromStr, sync::Mutex};
 use efs::{
     file::{Directory, File, Type},
     fs::{
-        ext2::{error::Ext2Error, Ext2Fs},
+        ext2::{block::Block, error::Ext2Error, Ext2Fs},
         FileSystem,
     },
     io::{Read, Seek, SeekFrom, Write},
@@ -15,7 +15,7 @@ use obliviate_core::consts::PAGE_SIZE;
 
 use crate::paged_object_store::{ObjID, PageRequest, PagedObjectStore, PagingImp};
 
-struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> {
+pub struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> {
     fs: Mutex<Ext2Fs<Device>>,
     _pd: PhantomData<P>,
 }
@@ -129,19 +129,34 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
     ) -> std::io::Result<()> {
         let mut file = self.get_object_as_file(id)?;
         let len = file.stat().size.0 as u64;
-        if offset > len {
-            let mut missing = offset - len;
+        if offset + buf.len() as u64 >= len {
+            let mut missing = offset + buf.len() as u64 - len;
             e2result_to_std(file.seek(SeekFrom::End(0)))?;
-            let pos = e2result_to_std(file.seek(SeekFrom::Current(0)))?;
             while missing > 0 {
                 let buf = [0; PAGE_SIZE];
                 let thislen = std::cmp::min(missing as usize, buf.len());
-                let pos = e2result_to_std(file.seek(SeekFrom::Current(0)))?;
                 e2result_to_std(file.write_all(&buf[0..thislen]))?;
                 missing -= thislen as u64;
             }
         }
-        let len = file.stat().size.0 as u64;
+
+        if offset.is_multiple_of(PAGE_SIZE as u64) && buf.len().is_multiple_of(PAGE_SIZE) {
+            let ino_number = file.stat().ino.0 as u32;
+            for p in 0..(buf.len() / PAGE_SIZE) {
+                let thisoffset = offset + (p * PAGE_SIZE) as u64;
+                let fs = self.fs.lock().unwrap();
+                let ext2 = fs.ext2_interface().lock();
+                let inode = e2result_to_std(ext2.inode(ino_number))?;
+                let blocks = e2result_to_std(inode.indirected_blocks(&ext2))?;
+                let logblock = thisoffset / ext2.superblock().block_size() as u64;
+                let block = blocks.block_at_offset(logblock as u32).unwrap();
+                let mut block = Block::new(fs.clone(), block);
+                drop(ext2);
+                drop(fs);
+                e2result_to_std(block.write(&buf[(p * PAGE_SIZE)..((p + 1) * PAGE_SIZE)]))?;
+            }
+            return Ok(());
+        }
         e2result_to_std(file.seek(SeekFrom::Start(offset)))?;
         e2result_to_std(file.write_all(buf))
     }
@@ -205,7 +220,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Devi
 }
 
 impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
-    fn new(fs: Ext2Fs<Device>) -> Self {
+    pub fn new(fs: Ext2Fs<Device>) -> Self {
         let path = Path::from_str("ids").unwrap();
         let root = fs.root().unwrap();
         if fs.get_file(&path, root, false).is_err() {
@@ -230,17 +245,14 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Devi
 mod tests {
     use std::fs::File;
     use std::io::ErrorKind;
-    use std::str::FromStr;
 
-    use efs::file::{Directory, ReadOnlyFile, Regular, Type};
     use efs::fs::ext2::Ext2Fs;
-    use efs::fs::FileSystem;
-    use efs::io::Write;
-    use efs::path::UnixStr;
-    use efs::permissions::Permissions;
-    use efs::types::{Gid, Uid};
+    use efs::io::StdIOWrapper;
     use obliviate_core::consts::PAGE_SIZE;
+    use rand::seq::SliceRandom;
+    use rand::RngCore;
 
+    use crate::cached_disk::CachedDisk;
     use crate::paged_object_store::{PageRequest, PagedObjectStore, PagingImp};
 
     use super::Ext2ObjectStore;
@@ -264,6 +276,7 @@ mod tests {
             &self.phys_page
         }
     }
+
     #[test]
     fn ext2_config_id() {
         let file = File::options()
@@ -271,14 +284,143 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
         let res = os.get_config_id();
         assert_eq!(res.unwrap_err().kind(), ErrorKind::NotFound);
         os.set_config_id(123).unwrap();
+        run_fsck();
         let res = os.get_config_id();
         assert_eq!(res.unwrap(), 123);
-        os.delete_object(0);
+        os.delete_object(0).unwrap();
+        run_fsck();
+    }
+
+    #[test]
+    fn ext2_obj_stress() {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open("image.ext2")
+            .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
+        let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
+        let os = Ext2ObjectStore::new(fs);
+        let id = rand::random::<u128>();
+        os.create_object(id).unwrap();
+        //eprintln!("building data");
+        const DATA_SIZE: usize = 1024 * 1024 * 10;
+        let mut data = vec![0; DATA_SIZE];
+        rand::thread_rng().fill_bytes(&mut data);
+
+        let nr_pages = DATA_SIZE / PAGE_SIZE;
+
+        let mut reqs = (0..nr_pages)
+            .into_iter()
+            .map(|p| {
+                let mut phys = Box::new([0; PAGE_SIZE]);
+                phys.copy_from_slice(&data[(p * PAGE_SIZE)..((p + 1) * PAGE_SIZE)]);
+                PageRequest::new(TestPageRequest { phys_page: phys }, p as i64, 1)
+            })
+            .collect::<Vec<_>>();
+        reqs.shuffle(&mut rand::thread_rng());
+        let mut read_reqs = (0..nr_pages)
+            .into_iter()
+            .map(|p| {
+                let phys = Box::new([0; PAGE_SIZE]);
+                PageRequest::new(TestPageRequest { phys_page: phys }, p as i64, 1)
+            })
+            .collect::<Vec<_>>();
+
+        //eprintln!("Sending pageout");
+        let count = os.page_out_object(id, &reqs).unwrap();
+        assert_eq!(count, reqs.len());
+        //eprintln!("Page in");
+        let count = os.page_in_object(id, &mut read_reqs).unwrap();
+        assert_eq!(count, read_reqs.len());
+
+        for p in 0..nr_pages {
+            assert_eq!(
+                &*read_reqs[p].imp.phys_page,
+                &data[(p * PAGE_SIZE)..((p + 1) * PAGE_SIZE)]
+            );
+        }
+        run_fsck();
+    }
+
+    fn run_fsck() {
+        std::eprintln!("running fsck");
+        let status = std::process::Command::new("/opt/homebrew/opt/e2fsprogs/sbin/fsck.ext2")
+            .arg("-f")
+            .arg("-n")
+            .arg("image.ext2")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    fn many_objects() {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open("image.ext2")
+            .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
+        let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        for _i in 0..100 {
+            //std::eprintln!("{}", i);
+            let id = rand::random::<u128>();
+            {
+                os.create_object(id).unwrap();
+                os.write_object(id, 0, &id.to_le_bytes()).unwrap();
+            }
+            let mut buf = [0; 16];
+            let _len = os.read_object(id, 0, &mut buf).unwrap();
+            let read_id = u128::from_le_bytes(buf);
+
+            assert_eq!(id, read_id);
+            os.delete_object(id).unwrap();
+            assert!(os.read_object(id, 0, &mut []).is_err());
+        }
+        run_fsck();
+    }
+
+    #[test]
+    fn many_objects_at_once() {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open("image.ext2")
+            .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
+        let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        let mut ids = Vec::new();
+        for _i in 0..100 {
+            //std::eprintln!("{}", i);
+            let id = rand::random::<u128>();
+            os.create_object(id).unwrap();
+            os.write_object(id, 0, &id.to_le_bytes()).unwrap();
+            ids.push(id);
+        }
+        run_fsck();
+
+        for id in ids {
+            let mut buf = [0; 16];
+            let _len = os.read_object(id, 0, &mut buf).unwrap();
+            let read_id = u128::from_le_bytes(buf);
+            assert_eq!(id, read_id);
+            os.delete_object(id).unwrap();
+            assert!(os.read_object(id, 0, &mut []).is_err());
+        }
+        run_fsck();
     }
 
     #[test]
@@ -288,6 +430,8 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::new(fs);
         let id = rand::random::<u128>();
@@ -303,6 +447,7 @@ mod tests {
         let reqs = [PageRequest::new(req, 8, 1), PageRequest::new(req2, 12, 1)];
         let count = os.page_out_object(id, &reqs).unwrap();
         assert_eq!(count, 2);
+        run_fsck();
         let rreq = TestPageRequest {
             phys_page: Box::new([0; PAGE_SIZE]),
         };
@@ -323,63 +468,26 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
+        let file = CachedDisk::new(file);
+        let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
         let id = rand::random::<u128>();
         os.create_object(id).unwrap();
         let mut buf = [1; 1024];
         let mut buf2 = [0; 1024];
-        let mut buf_0 = [0; 1024];
+        let buf_0 = [0; 1024];
         os.write_object(id, 0, &mut buf).unwrap();
-        let len = os.read_object(id, 0, &mut buf2);
+        let _len = os.read_object(id, 0, &mut buf2);
         assert_eq!(buf2, buf);
         os.write_object(id, 4096, &mut buf).unwrap();
-        let len = os.read_object(id, 4096, &mut buf2);
+        let _len = os.read_object(id, 4096, &mut buf2);
         assert_eq!(buf2, buf);
 
         let len = os.read_object(id, 2048, &mut buf2);
         assert_eq!(len.unwrap(), 1024);
         assert_eq!(buf2, buf_0);
-    }
-
-    //#[test]
-    fn _ext2_basic() {
-        let file = File::options()
-            .read(true)
-            .write(true)
-            .open("image.ext2")
-            .expect("failed to open test image");
-        let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let mut root = fs.root().expect("failed to get root");
-        let name = UnixStr::from_str("test").unwrap();
-        let test_entry = if let Some(test_entry) = root.entry(name.clone()).ok().flatten() {
-            test_entry
-        } else {
-            root.add_entry(
-                name.clone(),
-                Type::Regular,
-                Permissions::USER_WRITE | Permissions::USER_WRITE,
-                Uid(0),
-                Gid(0),
-            )
-            .expect("failed to add entry test");
-            root.entry(name.clone())
-                .ok()
-                .flatten()
-                .expect("failed to make new test entry")
-        };
-        let mut reg = match test_entry {
-            efs::file::TypeWithFile::Regular(reg) => reg,
-            _ => panic!("unexpect test entry type"),
-        };
-        let stat = reg.stat();
-
-        reg.truncate(0).expect("failed to truncate test");
-        reg.write_all(&[0; 4096]).unwrap();
-        let stat = reg.stat();
-
-        let ext2 = fs.lock();
-        let inode = ext2.inode(stat.ino.0 as u32).unwrap();
-        let ib = inode.indirected_blocks(&*ext2).unwrap();
+        os.delete_object(id).unwrap();
+        run_fsck();
     }
 }

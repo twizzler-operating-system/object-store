@@ -940,6 +940,7 @@ dependencies = [
  "chacha20",
  "efs",
  "intervaltree",
+ "lru",
  "obliviate-core",
  "pci-ids",
  "rand",

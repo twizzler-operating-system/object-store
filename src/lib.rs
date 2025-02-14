@@ -1,5 +1,6 @@
 #![feature(iterator_try_collect)]
 #![feature(slice_as_chunks)]
+#![feature(unsigned_is_multiple_of)]
 // mod disk;
 //mod fs;
 // mod nvme;
@@ -8,6 +9,7 @@
 //mod wrapped_extent;
 // pub use fs::FS;
 //pub use object_store::*;
+pub mod cached_disk;
 pub mod ext2;
 pub mod paged_object_store;
 

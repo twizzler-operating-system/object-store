@@ -20,6 +20,7 @@ pci-ids = "0.2.4"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
 efs = { path = "efs", features = ["std", "ext2"] }
+lru = "*"
 
 [dev-dependencies]
 tracing-subscriber = "*"
