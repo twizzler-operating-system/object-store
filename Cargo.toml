@@ -19,7 +19,7 @@ volatile = "0.5"
 pci-ids = "0.2.4"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
-efs = { path = "efs", features = ["std", "ext2"] }
+efs = { git = "https://github.com/dbittman/efs", features = ["std", "ext2"] }
 lru = "*"
 
 [dev-dependencies]
