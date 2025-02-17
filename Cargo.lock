@@ -683,7 +683,7 @@ dependencies = [
 [[package]]
 name = "heapsize-derive"
 version = "0.1.0"
-source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#1b92a457f9ad64e3f16d79d759f0423b3177a265"
+source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#b02c4e35ff9c3ac6f2bebfbb30a4994248a8d173"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -879,7 +879,7 @@ dependencies = [
 [[package]]
 name = "lru-mem"
 version = "0.3.0"
-source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#1b92a457f9ad64e3f16d79d759f0423b3177a265"
+source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#b02c4e35ff9c3ac6f2bebfbb30a4994248a8d173"
 dependencies = [
  "hashbrown 0.14.5",
  "heapsize-derive",
@@ -939,6 +939,7 @@ dependencies = [
  "async-trait",
  "chacha20",
  "efs",
+ "fatfs",
  "intervaltree",
  "lru",
  "obliviate-core",
@@ -952,7 +953,7 @@ dependencies = [
 [[package]]
 name = "obliviate-core"
 version = "0.1.0"
-source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#1b92a457f9ad64e3f16d79d759f0423b3177a265"
+source = "git+https://github.com/twizzler-operating-system/obliviate.git?branch=nonstatic_lifetime_support#b02c4e35ff9c3ac6f2bebfbb30a4994248a8d173"
 dependencies = [
  "aes",
  "bincode",

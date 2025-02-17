@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
     io::{Error, ErrorKind},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard},
 };
 
 use chacha20::{
@@ -10,23 +10,15 @@ use chacha20::{
     ChaCha20,
 };
 use fatfs::{
-    DefaultTimeProvider, Dir, IoBase, LossyOemCpConverter, NullTimeProvider, Read as _,
-    ReadWriteProxy, Seek, SeekFrom, Write as _,
+    DefaultTimeProvider, Dir, IoBase, LossyOemCpConverter, Read as _, ReadWriteProxy, Seek,
+    SeekFrom, Write as _,
 };
-use obliviate_core::{
-    crypter::{aes::Aes256Ctr, ivs::SequentialIvg},
-    hasher::sha3::{Sha3_256, SHA3_256_MD_SIZE},
-    kms::{
-        khf::Khf, InstrumentedKeyManagementScheme, KeyManagementScheme,
-        PersistableKeyManagementScheme, StableKeyManagementScheme,
-    },
-    wal::SecureWAL,
-};
-use rand::rngs::OsRng;
+use obliviate_core::kms::{PersistableKeyManagementScheme, StableKeyManagementScheme};
 
 use crate::{
     fs::{Disk, FileSystem, PAGE_SIZE},
     kms::Kms,
+    paged_object_store::{PagedObjectStore, PagingImp},
     wrapped_extent::WrappedExtent,
 };
 
@@ -35,7 +27,7 @@ type EncodedObjectId = String;
 fn encode_obj_id(obj_id: u128) -> EncodedObjectId {
     format!("{:0>32x}", obj_id)
 }
-pub struct ObjectStore<D: Disk> {
+pub struct LetheObjectStore<D: Disk> {
     fs: FileSystem<D>,
     kms: Kms<D>,
     root_key: [u8; 32],
@@ -57,7 +49,7 @@ where
 }
 
 // while 'a represents the lifetime of the Disk
-impl<D> ObjectStore<D>
+impl<D> LetheObjectStore<D>
 where
     D: Disk,
     std::io::Error: From<fatfs::Error<D::Error>>,
@@ -187,7 +179,7 @@ where
         Ok(len)
     }
     /// Either gets a previously set config_id from disk or returns None
-    pub fn get_config_id(&self) -> Result<Option<u128>, Error> {
+    pub fn do_get_config_id(&self) -> Result<Option<u128>, Error> {
         let fs = self.fs().lock().unwrap();
         let file = fs.root_dir().open_file("config_id");
         let mut file = match file {
@@ -200,7 +192,7 @@ where
         Ok(Some(u128::from_le_bytes(buf)))
     }
     /// Stores a config_id onto the disk.
-    pub fn set_config_id(&self, id: u128) -> Result<(), Error> {
+    pub fn do_set_config_id(&self, id: u128) -> Result<(), Error> {
         let fs = self.fs().lock().unwrap();
         let mut file = fs.root_dir().create_file("config_id")?;
         file.truncate()?;
@@ -210,7 +202,7 @@ where
     }
 
     /// Returns true if file was created and false if the file already existed.
-    pub fn create_object(&self, obj_id: u128) -> Result<bool, Error> {
+    pub fn do_create_object(&self, obj_id: u128) -> Result<bool, Error> {
         let b64 = encode_obj_id(obj_id);
         let mut fs = self.fs().lock().unwrap();
         let subdir = get_dir_path(&mut fs, &b64)?;
@@ -503,4 +495,233 @@ fn get_symmetric_cipher_from_key(disk_offset: u64, key: [u8; 32]) -> Result<ChaC
     let mut cipher = ChaCha20::new(&key.into(), &nonce.into());
     cipher.seek(offset);
     Ok(cipher)
+}
+
+impl<D: Disk, P: PagingImp> PagedObjectStore<P> for LetheObjectStore<D>
+where
+    D: Disk,
+    std::io::Error: From<fatfs::Error<D::Error>>,
+    fatfs::Error<std::io::Error>: From<<D as IoBase>::Error>,
+    fatfs::Error<<D as IoBase>::Error>: From<std::io::Error>,
+    std::io::Error: From<D::Error>,
+    D::Error: std::error::Error + Send + Sync + 'static,
+{
+    fn create_object(&self, id: crate::paged_object_store::ObjID) -> std::io::Result<()> {
+        self.do_create_object(id).map(|_| ())
+    }
+
+    fn delete_object(&self, id: crate::paged_object_store::ObjID) -> std::io::Result<()> {
+        self.unlink_object(id)
+    }
+
+    fn read_object(
+        &self,
+        id: crate::paged_object_store::ObjID,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> std::io::Result<usize> {
+        self.read_exact(id, buf, offset)?;
+        Ok(buf.len())
+    }
+
+    fn write_object(
+        &self,
+        id: crate::paged_object_store::ObjID,
+        offset: u64,
+        buf: &[u8],
+    ) -> std::io::Result<()> {
+        self.write_all(id, buf, offset)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs::{File, OpenOptions},
+        io::{Seek, Write},
+        ops::Deref,
+        path::Path,
+        sync::{Arc, LazyLock, Mutex, MutexGuard},
+    };
+
+    use super::*;
+    use fatfs::{IoBase, StdIoWrapper};
+    #[derive(Clone)]
+    struct FileDisk {
+        disk: Arc<Mutex<StdIoWrapper<File>>>,
+    }
+
+    fn arc_mutex_wrap<T>(v: T) -> Arc<Mutex<T>> {
+        Arc::new(Mutex::new(v))
+    }
+
+    impl FileDisk {
+        fn file_wrap(file: File) -> Arc<Mutex<StdIoWrapper<File>>> {
+            arc_mutex_wrap(StdIoWrapper::new(file))
+        }
+
+        pub fn open<T: AsRef<Path>>(path: T) -> Self {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap();
+            let target_len: u64 = 0x3_0000_0000;
+            let curr_len = file.seek(std::io::SeekFrom::End(0)).unwrap();
+            if curr_len < target_len {
+                for _ in (curr_len..target_len).step_by(4096) {
+                    file.write(&[0u8; 4096]).unwrap();
+                }
+                file.write(&[0u8; 4096]).unwrap();
+            }
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+            let v = file.seek(std::io::SeekFrom::Current(0)).unwrap();
+            println!("{:?}", v);
+            Self {
+                disk: Self::file_wrap(file),
+            }
+        }
+
+        fn lock(&self) -> MutexGuard<'_, StdIoWrapper<File>> {
+            self.disk.lock().unwrap()
+        }
+    }
+
+    static OBJECT_STORE: LazyLock<Mutex<LetheObjectStore<FileDisk>>> = LazyLock::new(|| {
+        let disk = FileDisk::open("/tmp/get_unique_id.img");
+        Mutex::new(LetheObjectStore::open(disk, [0u8; 32]))
+    });
+
+    impl IoBase for FileDisk {
+        type Error = std::io::Error;
+    }
+
+    impl fatfs::Read for FileDisk {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+            self.lock().read(buf)
+        }
+    }
+
+    impl fatfs::Seek for FileDisk {
+        fn seek(&mut self, pos: fatfs::SeekFrom) -> Result<u64, Self::Error> {
+            self.lock().seek(pos)
+        }
+    }
+
+    impl fatfs::Write for FileDisk {
+        fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            self.lock().write(buf)
+        }
+
+        fn flush(&mut self) -> Result<(), Self::Error> {
+            self.lock().flush()
+        }
+    }
+
+    fn get_unique_id<OsRef: Deref<Target = LetheObjectStore<FileDisk>>>(fs: &OsRef) -> u128 {
+        let mut id: u128 = rand::random();
+        while !fs.do_create_object(id).unwrap() {
+            id = rand::random();
+        }
+        id
+    }
+
+    fn make_and_check_file<OsRef>(fs: &OsRef, buf1: &mut [u8], buf2: &mut [u8]) -> (Vec<u8>, u128)
+    where
+        OsRef: Deref<Target = LetheObjectStore<FileDisk>>,
+    {
+        let id: u128 = get_unique_id(fs);
+        let random_value = rand::random();
+        // println!("{}", random_value);
+        buf1.fill_with(|| random_value);
+        fs.write_all(id, buf1, 0).unwrap();
+        fs.read_exact(id, buf2, 0).unwrap();
+        assert!(buf1 == buf2);
+        (buf2.into(), id)
+    }
+
+    #[test]
+    pub fn zero_length_file() {
+        let buf = vec![0u8; 5000];
+        let os = OBJECT_STORE.lock().unwrap();
+        os.do_create_object(0).unwrap();
+        os.write_all(0, &buf, 0).unwrap();
+        os.unlink_object(0).unwrap();
+    }
+
+    #[test]
+    fn get_all_ids() {
+        let _all_ids = OBJECT_STORE.lock().unwrap().get_all_object_ids().unwrap();
+    }
+
+    #[test]
+    fn test_lfn() {
+        let os = OBJECT_STORE.lock().unwrap();
+        let id1: u128 = get_unique_id(&os);
+        let id2: u128 = id1 + 1;
+        assert!(os.do_create_object(id2).unwrap());
+        os.write_all(id1, b"asdf", 0).unwrap();
+        os.write_all(id2, b"ghjk", 0).unwrap();
+
+        let mut b1: [u8; 4] = [0; 4];
+        let mut b2: [u8; 4] = [0; 4];
+        os.read_exact(id1, &mut b1, 0).unwrap();
+        os.read_exact(id2, &mut b2, 0).unwrap();
+        assert!(&b1 == b"asdf");
+        assert!(&b2 == b"ghjk");
+    }
+
+    #[test]
+    fn test_khf_serde() {
+        let os = OBJECT_STORE.lock().unwrap();
+        let id: u128 = get_unique_id(&os);
+        os.do_create_object(id).unwrap();
+        os.write_all(id, b"asdf", 0).unwrap();
+        os.advance_epoch().unwrap();
+        drop(os);
+        let mut os = OBJECT_STORE.lock().unwrap();
+        os.reopen();
+        drop(os);
+        let os = OBJECT_STORE.lock().unwrap();
+        let mut buf = [0u8; 4];
+        os.read_exact(id, &mut buf, 0).unwrap();
+        assert!(&buf == b"asdf");
+    }
+
+    #[test]
+    fn it_works() {
+        let mut working_bufs = (vec![0; 5000], vec![0; 5000]);
+        let mut os = OBJECT_STORE.lock().unwrap();
+        // println!("{:?}", KHF.lock().unwrap());
+        let out = (0..10)
+            .map(|_i| make_and_check_file(&os, &mut working_bufs.0, &mut working_bufs.1))
+            .collect::<Vec<_>>();
+        os.advance_epoch().unwrap();
+        os.reopen();
+
+        // println!("{:?}", KHF.lock().unwrap());
+        for (value, id) in out {
+            // make sure buf == read
+            let mut buf = vec![0; 5000];
+            let v = os.get_obj_segments(id).unwrap();
+            println!("{:?}", v);
+            os.read_exact(id, &mut buf, 0).unwrap();
+            for (i, (b1, b2)) in value.iter().zip(buf.iter()).enumerate() {
+                let diff = (*b1 as i16) - (*b2 as i16);
+                if diff != 0 {
+                    print!("D @ {i}: {diff}\t");
+                }
+            }
+            assert!(value == buf);
+            // unlink
+            os.unlink_object(id).unwrap();
+            os.advance_epoch().unwrap();
+            os.reopen();
+            // println!("{:?}", KHF.lock().unwrap());
+            // make sure object is unlinked
+            let v = os.read_exact(id, &mut buf, 0).expect_err("should be error");
+            assert!(v.kind() == std::io::ErrorKind::NotFound);
+        }
+    }
 }

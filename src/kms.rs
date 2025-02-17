@@ -1,5 +1,3 @@
-mod vis;
-
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fatfs::{LossyOemCpConverter, NullTimeProvider};

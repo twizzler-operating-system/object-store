@@ -252,7 +252,6 @@ mod tests {
     use rand::seq::SliceRandom;
     use rand::RngCore;
 
-    use crate::cached_disk::CachedDisk;
     use crate::paged_object_store::{PageRequest, PagedObjectStore, PagingImp};
 
     use super::Ext2ObjectStore;
@@ -284,7 +283,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
@@ -305,7 +303,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::new(fs);
@@ -369,7 +366,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
@@ -398,7 +394,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
@@ -430,7 +425,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::new(fs);
@@ -468,7 +462,6 @@ mod tests {
             .write(true)
             .open("image.ext2")
             .expect("failed to open test image");
-        let file = CachedDisk::new(file);
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
         let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
