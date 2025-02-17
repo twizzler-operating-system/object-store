@@ -22,6 +22,8 @@ use crate::{
     wrapped_extent::WrappedExtent,
 };
 
+pub use fatfs::StdIoWrapper;
+
 type EncodedObjectId = String;
 
 fn encode_obj_id(obj_id: u128) -> EncodedObjectId {

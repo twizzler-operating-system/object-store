@@ -10,5 +10,7 @@ mod ext2;
 pub mod paged_object_store;
 
 pub use ext2::Ext2ObjectStore;
-pub use lethe_object_store::LetheObjectStore;
+pub use lethe_object_store::{
+    key_fprint, LetheObjectStore, LetheState, PerObjLetheState, StdIoWrapper as LetheIoWrapper,
+};
 pub use paged_object_store::*;
