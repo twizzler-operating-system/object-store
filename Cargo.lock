@@ -548,7 +548,7 @@ dependencies = [
 [[package]]
 name = "efs"
 version = "0.4.2"
-source = "git+https://github.com/dbittman/efs#e942b37641641d7f119371a7d7d1e766afd2363f"
+source = "git+https://github.com/dbittman/efs#3ab723d6cb209b1bb02242d04104856b48369034"
 dependencies = [
  "bitflags",
  "cfg-if",
