@@ -9,6 +9,7 @@ use chacha20::{
     cipher::{KeyIvInit, StreamCipher, StreamCipherSeek},
     ChaCha20,
 };
+pub use fatfs::StdIoWrapper;
 use fatfs::{
     DefaultTimeProvider, Dir, IoBase, LossyOemCpConverter, Read as _, ReadWriteProxy, Seek,
     SeekFrom, Write as _,
@@ -21,8 +22,6 @@ use crate::{
     paged_object_store::{PagedObjectStore, PagingImp},
     wrapped_extent::WrappedExtent,
 };
-
-pub use fatfs::StdIoWrapper;
 
 type EncodedObjectId = String;
 
@@ -67,11 +66,12 @@ where
     /// # Panics
     /// When there is a Disk error or when a lock is not
     /// able to be claimed
-    pub fn reformat(&mut self, mut disk: D, root_key: Option<[u8; 32]>) {
+    pub fn reformat(&mut self, mut disk: D, root_key: Option<[u8; 32]>) -> std::io::Result<()> {
         FileSystem::format(&mut disk);
         self.root_key = root_key.unwrap_or(self.root_key);
-        self.fs = FileSystem::open_fs(disk);
+        self.fs = FileSystem::open_fs(disk)?;
         self.kms = Kms::open(self.fs.fs_as_owned(), self.root_key);
+        Ok(())
     }
     /// Reopens Object Store from disk.
     /// Useful for testing persistance/recovery
@@ -159,8 +159,8 @@ where
     /// # Safety
     /// If the disk gets corrupted then it might not securely delete
     /// what used to be on the disk.
-    pub fn open(disk: D, root_key: [u8; 32]) -> Self {
-        let fs = FileSystem::open_fs(disk);
+    pub fn open(disk: D, root_key: [u8; 32]) -> std::io::Result<Self> {
+        let fs = FileSystem::open_fs(disk)?;
         let fs_ref = fs.fs_as_owned();
         Self::restore_khf(&fs.fs().lock().unwrap());
         let out = Self {
@@ -168,7 +168,7 @@ where
             kms: Kms::open(fs_ref, root_key),
             root_key,
         };
-        out
+        Ok(out)
     }
 
     /// Returns the disk length of a given object on disk.
@@ -534,6 +534,10 @@ where
     ) -> std::io::Result<()> {
         self.write_all(id, buf, offset)
     }
+
+    fn flush(&self) -> std::io::Result<()> {
+        self.advance_epoch()
+    }
 }
 
 #[cfg(test)]
@@ -546,8 +550,9 @@ mod tests {
         sync::{Arc, LazyLock, Mutex, MutexGuard},
     };
 
-    use super::*;
     use fatfs::{IoBase, StdIoWrapper};
+
+    use super::*;
     #[derive(Clone)]
     struct FileDisk {
         disk: Arc<Mutex<StdIoWrapper<File>>>,

@@ -7,10 +7,14 @@ use obliviate_core::consts::PAGE_SIZE;
 pub trait PagingImp {
     type PhysAddr;
 
+    fn page_size() -> usize {
+        PAGE_SIZE
+    }
+
     fn fill_from_buffer(&mut self, buf: &[u8]);
     fn read_to_buffer(&self, buf: &mut [u8]);
 
-    fn phys_addr(&self) -> &Self::PhysAddr;
+    fn phys_addrs(&self) -> impl Iterator<Item = &'_ Self::PhysAddr>;
 }
 
 pub struct PageRequest<P: PagingImp> {
@@ -52,6 +56,10 @@ pub trait PagedObjectStore<P: PagingImp> {
 
     fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 
     fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest<P>]) -> Result<usize> {
         let mut buf = [0; PAGE_SIZE];

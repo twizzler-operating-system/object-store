@@ -1,4 +1,7 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    io::ErrorKind,
+    sync::{Arc, Mutex},
+};
 
 use fatfs::{
     FatType, FormatVolumeOptions, IoBase, LossyOemCpConverter, NullTimeProvider, ReadWriteSeek,
@@ -27,15 +30,17 @@ impl<D: Disk + Clone> FileSystem<D> {
     }
     /// Will attempt to open the filesystem
     /// and will reformat the filesystem if it is unable to open it
-    pub fn open_fs(mut disk: D) -> FileSystem<D> {
+    pub fn open_fs(mut disk: D) -> std::io::Result<FileSystem<D>> {
         let fs_options = fatfs::FsOptions::new().update_accessed_date(false);
         let fs = fatfs::FileSystem::new(disk.clone(), fs_options);
         if let Ok(fs) = fs {
-            return Self {
+            return Ok(Self {
                 fs: Arc::new(Mutex::new(fs)),
                 disk,
-            };
+            });
         }
+        return Err(ErrorKind::InvalidData.into());
+        /*
         drop(fs);
         disk.seek(fatfs::SeekFrom::Start(0)).unwrap();
         Self::format(&mut disk);
@@ -45,6 +50,7 @@ impl<D: Disk + Clone> FileSystem<D> {
             fs: Arc::new(Mutex::new(fs)),
             disk,
         }
+        */
     }
 
     pub fn reopen(&mut self) {

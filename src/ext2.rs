@@ -3,10 +3,10 @@ use std::{io::ErrorKind, marker::PhantomData, str::FromStr, sync::Mutex};
 use efs::{
     file::{Directory, File, Type},
     fs::{
-        ext2::{block::Block, error::Ext2Error, Ext2Fs},
+        ext2::{block::Block, error::Ext2Error, inode::Inode, Ext2, Ext2Fs},
         FileSystem,
     },
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, StdIOWrapper, Write},
     path::{Path, UnixStr},
     permissions::Permissions,
     types::{Gid, Uid},
@@ -18,6 +18,21 @@ use crate::paged_object_store::{ObjID, PageRequest, PagedObjectStore, PagingImp}
 pub struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> {
     fs: Mutex<Ext2Fs<Device>>,
     _pd: PhantomData<P>,
+}
+
+impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
+    fn with_inode<R>(
+        &self,
+        id: u128,
+        f: impl FnOnce(&Inode, &Ext2Fs<Device>, &Ext2<Device>) -> std::io::Result<R>,
+    ) -> std::io::Result<R> {
+        let file = self.get_object_as_file(id)?;
+        let ino_number = file.stat().ino.0 as u32;
+        let fs = self.fs.lock().unwrap();
+        let ext2 = fs.ext2_interface().lock();
+        let inode = e2result_to_std(ext2.inode(ino_number))?;
+        f(&inode, &*fs, &*ext2)
+    }
 }
 
 fn e2error_to_std(err: efs::error::Error<Ext2Error>) -> std::io::Error {
@@ -166,6 +181,24 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         id: crate::paged_object_store::ObjID,
         reqs: &'a mut [PageRequest<P>],
     ) -> std::io::Result<usize> {
+        let blocks = self.with_inode(id, |inode, fs, ext2| {
+            let ib = e2result_to_std(inode.indirected_blocks(ext2))?;
+            let blocks_per_page = P::page_size() / ext2.superblock().block_size() as usize;
+            let blocks = reqs
+                .iter()
+                .map(|req| {
+                    (
+                        &req.imp,
+                        (req.start_page..(req.start_page + req.nr_pages as i64))
+                            .map(|p| ib.block_at_offset(p as u32 * blocks_per_page as u32))
+                            .collect::<Vec<Option<u32>>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(blocks)
+        });
+        let mut file = self.get_object_as_file(id)?;
+
         let mut buf = [0; PAGE_SIZE];
         for req in reqs.iter_mut() {
             for i in 0..req.nr_pages {
@@ -219,8 +252,12 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Devi
     }
 }
 
-impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
-    pub fn new(fs: Ext2Fs<Device>) -> Self {
+impl<D: std::io::Read + std::io::Write + std::io::Seek, P: PagingImp>
+    Ext2ObjectStore<StdIOWrapper<D, Ext2Error>, P>
+{
+    pub fn new(device: D, device_id: u32) -> Result<Self, efs::error::Error<Ext2Error>> {
+        let device = StdIOWrapper::new(device);
+        let fs = Ext2Fs::new(device, device_id)?;
         let path = Path::from_str("ids").unwrap();
         let root = fs.root().unwrap();
         if fs.get_file(&path, root, false).is_err() {
@@ -234,27 +271,23 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Devi
             )
             .expect("failed to setup ids directory");
         }
-        Self {
+        Ok(Self {
             fs: Mutex::new(fs),
             _pd: PhantomData,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::ErrorKind;
+    use std::{fs::File, io::ErrorKind};
 
-    use efs::fs::ext2::Ext2Fs;
-    use efs::io::StdIOWrapper;
+    use efs::{fs::ext2::Ext2Fs, io::StdIOWrapper};
     use obliviate_core::consts::PAGE_SIZE;
-    use rand::seq::SliceRandom;
-    use rand::RngCore;
-
-    use crate::paged_object_store::{PageRequest, PagedObjectStore, PagingImp};
+    use rand::{seq::SliceRandom, RngCore};
 
     use super::Ext2ObjectStore;
+    use crate::paged_object_store::{PageRequest, PagedObjectStore, PagingImp};
 
     struct TestPageRequest {
         phys_page: Box<[u8; PAGE_SIZE]>,
@@ -271,8 +304,8 @@ mod tests {
             buf.copy_from_slice(&*self.phys_page);
         }
 
-        fn phys_addr(&self) -> &Self::PhysAddr {
-            &self.phys_page
+        fn phys_addrs(&self) -> impl Iterator<Item = &'_ Self::PhysAddr> {
+            &[self.phys_page]
         }
     }
 
@@ -285,7 +318,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs, 0);
         let res = os.get_config_id();
         assert_eq!(res.unwrap_err().kind(), ErrorKind::NotFound);
         os.set_config_id(123).unwrap();
@@ -305,7 +338,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::new(fs);
+        let os = Ext2ObjectStore::new(fs, 0);
         let id = rand::random::<u128>();
         os.create_object(id).unwrap();
         //eprintln!("building data");
@@ -368,7 +401,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs, 0);
         for _i in 0..100 {
             //std::eprintln!("{}", i);
             let id = rand::random::<u128>();
@@ -396,7 +429,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs, 0);
         let mut ids = Vec::new();
         for _i in 0..100 {
             //std::eprintln!("{}", i);
@@ -427,7 +460,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::new(fs);
+        let os = Ext2ObjectStore::new(fs, 0);
         let id = rand::random::<u128>();
         os.create_object(id).unwrap();
 
@@ -464,7 +497,7 @@ mod tests {
             .expect("failed to open test image");
         let file = StdIOWrapper::new(file);
         let fs = Ext2Fs::new(file, 0).expect("failed to open image as ext2");
-        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs);
+        let os = Ext2ObjectStore::<_, TestPageRequest>::new(fs, 0);
         let id = rand::random::<u128>();
         os.create_object(id).unwrap();
         let mut buf = [1; 1024];
