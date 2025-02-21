@@ -16,7 +16,7 @@ pub(crate) struct FileSystem<D: Disk> {
 pub const PAGE_SIZE: usize = 4096;
 pub const SECTOR_SIZE: usize = 512;
 
-impl<D: Disk> FileSystem<D> {
+impl<D: Disk + Clone> FileSystem<D> {
     pub fn format(disk: &mut D) {
         println!("reformatting");
         let options = FormatVolumeOptions::new()
