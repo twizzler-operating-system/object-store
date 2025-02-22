@@ -11,10 +11,18 @@ pub trait PagingImp {
         PAGE_SIZE
     }
 
-    fn fill_from_buffer(&mut self, buf: &[u8]);
+    fn fill_from_buffer(&self, buf: &[u8]);
     fn read_to_buffer(&self, buf: &mut [u8]);
 
     fn phys_addrs(&self) -> impl Iterator<Item = &'_ Self::PhysAddr>;
+
+    fn page_in(&self, disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
+        todo!()
+    }
+
+    fn page_out(&self, disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
+        todo!()
+    }
 }
 
 pub struct PageRequest<P: PagingImp> {

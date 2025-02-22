@@ -1,6 +1,7 @@
 use std::{io::ErrorKind, marker::PhantomData, str::FromStr, sync::Mutex};
 
 use efs::{
+    dev::Device,
     file::{Directory, File, Type},
     fs::{
         ext2::{block::Block, error::Ext2Error, inode::Inode, Ext2, Ext2Fs},
@@ -190,22 +191,21 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
                     (
                         &req.imp,
                         (req.start_page..(req.start_page + req.nr_pages as i64))
-                            .map(|p| ib.block_at_offset(p as u32 * blocks_per_page as u32))
-                            .collect::<Vec<Option<u32>>>(),
+                            .map(|p| {
+                                ib.block_at_offset(p as u32 * blocks_per_page as u32)
+                                    .map(|x| x as u64)
+                            })
+                            .collect::<Vec<Option<u64>>>(),
                     )
                 })
                 .collect::<Vec<_>>();
             Ok(blocks)
-        });
-        let mut file = self.get_object_as_file(id)?;
-
-        let mut buf = [0; PAGE_SIZE];
-        for req in reqs.iter_mut() {
-            for i in 0..req.nr_pages {
-                let page = req.start_page as usize + i as usize;
-                self.read_object(id, (page * PAGE_SIZE) as u64, &mut buf)?;
-                req.imp.fill_from_buffer(&buf);
-            }
+        })?;
+        tracing::debug!("paging request for {} reqs", reqs.len());
+        for br in blocks {
+            tracing::debug!("==> {:?}", br.1);
+            let _plen = br.1.len();
+            let _len = br.0.page_in(br.1.into_iter())?;
         }
         Ok(reqs.len())
     }
@@ -215,13 +215,42 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         id: crate::paged_object_store::ObjID,
         reqs: &'a [PageRequest<P>],
     ) -> std::io::Result<usize> {
-        let mut buf = [0; PAGE_SIZE];
-        for req in reqs.iter() {
-            for i in 0..req.nr_pages {
-                req.imp.read_to_buffer(&mut buf);
-                let page = req.start_page as usize + i as usize;
-                self.write_object(id, (page * PAGE_SIZE) as u64, &buf)?;
-            }
+        let end_offset = reqs
+            .iter()
+            .max_by_key(|req| req.start_page as u64 + req.nr_pages as u64)
+            .map(|end_req| {
+                (end_req.start_page as u64 + end_req.nr_pages as u64) * P::page_size() as u64
+            });
+
+        let mut file = self.get_object_as_file(id)?;
+        if end_offset.unwrap_or(0) >= file.size().0 {
+            self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
+        }
+        let blocks = self.with_inode(id, |inode, fs, ext2| {
+            let ib = e2result_to_std(inode.indirected_blocks(ext2))?;
+            let blocks_per_page = P::page_size() / ext2.superblock().block_size() as usize;
+            let blocks = reqs
+                .iter()
+                .map(|req| {
+                    (
+                        &req.imp,
+                        (req.start_page..(req.start_page + req.nr_pages as i64))
+                            .map(|p| {
+                                ib.block_at_offset(p as u32 * blocks_per_page as u32)
+                                    .map(|x| x as u64)
+                            })
+                            .collect::<Vec<Option<u64>>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            Ok(blocks)
+        })?;
+        tracing::debug!("paging request for {} reqs", reqs.len());
+        for br in blocks {
+            tracing::debug!("==> {:?}", br.1);
+            let plen = br.1.len();
+            let len = br.0.page_out(br.1.into_iter())?;
+            assert_eq!(len, plen);
         }
         Ok(reqs.len())
     }
