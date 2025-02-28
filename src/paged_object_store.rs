@@ -16,11 +16,11 @@ pub trait PagingImp {
 
     fn phys_addrs(&self) -> impl Iterator<Item = &'_ Self::PhysAddr>;
 
-    fn page_in(&self, disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
+    fn page_in(&self, _disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
         todo!()
     }
 
-    fn page_out(&self, disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
+    fn page_out(&self, _disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
         todo!()
     }
 }

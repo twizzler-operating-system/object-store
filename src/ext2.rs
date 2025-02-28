@@ -182,7 +182,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         id: crate::paged_object_store::ObjID,
         reqs: &'a mut [PageRequest<P>],
     ) -> std::io::Result<usize> {
-        let blocks = self.with_inode(id, |inode, fs, ext2| {
+        let blocks = self.with_inode(id, |inode, _, ext2| {
             let ib = e2result_to_std(inode.indirected_blocks(ext2))?;
             let blocks_per_page = P::page_size() / ext2.superblock().block_size() as usize;
             let blocks = reqs
@@ -226,7 +226,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         if end_offset.unwrap_or(0) >= file.size().0 {
             self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
         }
-        let blocks = self.with_inode(id, |inode, fs, ext2| {
+        let blocks = self.with_inode(id, |inode, _, ext2| {
             let ib = e2result_to_std(inode.indirected_blocks(ext2))?;
             let blocks_per_page = P::page_size() / ext2.superblock().block_size() as usize;
             let blocks = reqs

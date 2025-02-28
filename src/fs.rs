@@ -21,7 +21,6 @@ pub const SECTOR_SIZE: usize = 512;
 
 impl<D: Disk + Clone> FileSystem<D> {
     pub fn format(disk: &mut D) {
-        println!("reformatting");
         let options = FormatVolumeOptions::new()
             .bytes_per_sector(SECTOR_SIZE as u16)
             .bytes_per_cluster(PAGE_SIZE as u32)
@@ -29,8 +28,7 @@ impl<D: Disk + Clone> FileSystem<D> {
         fatfs::format_volume(disk, options).unwrap();
     }
     /// Will attempt to open the filesystem
-    /// and will reformat the filesystem if it is unable to open it
-    pub fn open_fs(mut disk: D) -> std::io::Result<FileSystem<D>> {
+    pub fn open_fs(disk: D) -> std::io::Result<FileSystem<D>> {
         let fs_options = fatfs::FsOptions::new().update_accessed_date(false);
         let fs = fatfs::FileSystem::new(disk.clone(), fs_options);
         if let Ok(fs) = fs {
@@ -40,17 +38,6 @@ impl<D: Disk + Clone> FileSystem<D> {
             });
         }
         return Err(ErrorKind::InvalidData.into());
-        /*
-        drop(fs);
-        disk.seek(fatfs::SeekFrom::Start(0)).unwrap();
-        Self::format(&mut disk);
-        let fs = fatfs::FileSystem::new(disk.clone(), fs_options)
-            .expect("disk should be formatted now so no more errors.");
-        Self {
-            fs: Arc::new(Mutex::new(fs)),
-            disk,
-        }
-        */
     }
 
     pub fn reopen(&mut self) {
