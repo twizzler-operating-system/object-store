@@ -25,6 +25,7 @@ pub trait PagingImp {
     }
 }
 
+#[derive(Debug)]
 pub struct PageRequest<P: PagingImp> {
     pub start_page: i64,
     pub imp: P,

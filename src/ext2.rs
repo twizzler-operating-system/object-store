@@ -247,10 +247,12 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         })?;
         tracing::debug!("paging request for {} reqs", reqs.len());
         for br in blocks {
-            tracing::debug!("==> {:?}", br.1);
-            let plen = br.1.len();
-            let len = br.0.page_out(br.1.into_iter())?;
-            assert_eq!(len, plen);
+            tracing::trace!("==> {:?}", br.1);
+            let mut pages = &br.1[..];
+            while pages.len() > 0 {
+                let len = br.0.page_out(pages.into_iter().cloned())?;
+                pages = &pages[len..];
+            }
         }
         Ok(reqs.len())
     }
