@@ -63,6 +63,8 @@ pub trait PagedObjectStore<P: PagingImp> {
     fn create_object(&self, id: ObjID) -> Result<()>;
     fn delete_object(&self, id: ObjID) -> Result<()>;
 
+    fn len(&self, id: ObjID) -> Result<u64>;
+
     fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 

@@ -538,6 +538,10 @@ where
     fn flush(&self) -> std::io::Result<()> {
         self.advance_epoch()
     }
+
+    fn len(&self, id: crate::ObjID) -> std::io::Result<u64> {
+        self.disk_length(id)
+    }
 }
 
 #[cfg(test)]

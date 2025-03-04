@@ -256,6 +256,11 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         }
         Ok(reqs.len())
     }
+
+    fn len(&self, id: ObjID) -> std::io::Result<u64> {
+        let file = self.get_object_as_file(id)?;
+        Ok(file.stat().size.0 as u64)
+    }
 }
 
 impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
