@@ -16,7 +16,6 @@ fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", b
 rand = "0.8.5"
 async-trait = "0.1.66"
 volatile = "0.5"
-pci-ids = "0.2.4"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
 efs = { git = "https://github.com/dbittman/efs", features = ["std", "ext2"] }
