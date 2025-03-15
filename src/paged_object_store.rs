@@ -1,10 +1,7 @@
 pub type ObjID = u128;
 
 use core::str;
-use std::{
-    io::{ErrorKind, Result},
-    path::Path,
-};
+use std::io::{ErrorKind, Result};
 
 use obliviate_core::consts::PAGE_SIZE;
 

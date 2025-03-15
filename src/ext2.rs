@@ -15,7 +15,7 @@ use efs::{
     io::{Read, Seek, SeekFrom, StdIOWrapper, Write},
     path::{Path, UnixStr},
     permissions::Permissions,
-    types::{Gid, Ino, Uid},
+    types::{Gid, Uid},
 };
 use obliviate_core::consts::PAGE_SIZE;
 
