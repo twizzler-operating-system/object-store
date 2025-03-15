@@ -4,17 +4,26 @@ use efs::{
     dev::Device,
     file::{Directory, File, Type},
     fs::{
-        ext2::{block::Block, error::Ext2Error, inode::Inode, Ext2, Ext2Fs},
+        ext2::{
+            block::Block,
+            error::Ext2Error,
+            inode::{Inode, ROOT_DIRECTORY_INODE},
+            Ext2, Ext2Fs,
+        },
         FileSystem,
     },
     io::{Read, Seek, SeekFrom, StdIOWrapper, Write},
     path::{Path, UnixStr},
     permissions::Permissions,
-    types::{Gid, Uid},
+    types::{Gid, Ino, Uid},
 };
 use obliviate_core::consts::PAGE_SIZE;
 
-use crate::paged_object_store::{ObjID, PageRequest, PagedObjectStore, PagingImp};
+use crate::{
+    ino_to_objid, objid_to_ino,
+    paged_object_store::{ObjID, PageRequest, PagedObjectStore, PagingImp},
+    ExternalFile, ExternalKind,
+};
 
 pub struct Ext2ObjectStore<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> {
     fs: Mutex<Ext2Fs<Device>>,
@@ -192,7 +201,12 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
                         &req.imp,
                         (req.start_page..(req.start_page + req.nr_pages as i64))
                             .map(|p| {
-                                ib.block_at_offset(p as u32 * blocks_per_page as u32)
+                                let mut block = p as u32;
+                                if objid_to_ino(id).is_some() {
+                                    // External files don't have null pages
+                                    block -= 1;
+                                }
+                                ib.block_at_offset(block * blocks_per_page as u32)
                                     .map(|x| x as u64)
                             })
                             .collect::<Vec<Option<u64>>>(),
@@ -261,6 +275,52 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         let file = self.get_object_as_file(id)?;
         Ok(file.stat().size.0 as u64)
     }
+
+    fn enumerate_external(&self, id: ObjID) -> std::io::Result<Vec<ExternalFile>> {
+        let fs = self.fs.lock().unwrap();
+        let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
+        if inonr == 0 {
+            inonr = ROOT_DIRECTORY_INODE;
+        }
+        let file = e2result_to_std(fs.file(inonr))?;
+
+        match file {
+            efs::file::TypeWithFile::Directory(dir) => Ok(dir
+                .entries()
+                .map_err(e2error_to_std)?
+                .iter()
+                .map(|de| {
+                    let (ino, kind) = match &de.file {
+                        efs::file::TypeWithFile::Regular(f) => {
+                            (f.stat().ino.0, ExternalKind::Regular)
+                        }
+                        efs::file::TypeWithFile::Directory(f) => {
+                            (f.stat().ino.0, ExternalKind::Directory)
+                        }
+                        efs::file::TypeWithFile::SymbolicLink(f) => {
+                            (f.stat().ino.0, ExternalKind::SymLink)
+                        }
+                        _ => (0, ExternalKind::Other),
+                    };
+                    ExternalFile::new(de.filename.as_bytes(), kind, ino_to_objid(ino as u32))
+                })
+                .collect()),
+            _ => Err(ErrorKind::NotADirectory.into()),
+        }
+    }
+
+    fn find_external(&self, id: ObjID) -> std::io::Result<usize> {
+        let fs = self.fs.lock().unwrap();
+        let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
+        if inonr == 0 {
+            inonr = ROOT_DIRECTORY_INODE;
+        }
+        let file = e2result_to_std(fs.file(inonr))?;
+        Ok(match file {
+            efs::file::TypeWithFile::Regular(reg) => reg.stat().size.0 as usize,
+            _ => 0,
+        })
+    }
 }
 
 impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Device, P> {
@@ -277,6 +337,14 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> Ext2ObjectStore<Devi
         &self,
         id: ObjID,
     ) -> std::io::Result<efs::fs::ext2::file::Regular<Device>> {
+        if let Some(ino) = objid_to_ino(id) {
+            let fs = self.fs.lock().unwrap();
+            let file = e2result_to_std(fs.file(ino))?;
+            return match file {
+                efs::file::TypeWithFile::Regular(reg) => Ok(reg),
+                _ => Err(ErrorKind::Other.into()),
+            };
+        }
         let path = self.get_id_path(id);
         let fs = self.fs.lock().unwrap();
         let root = fs.root().unwrap();
