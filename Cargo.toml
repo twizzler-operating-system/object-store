@@ -18,7 +18,7 @@ async-trait = "0.1.66"
 volatile = "0.6"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
-efs = { git = "https://github.com/dbittman/efs", features = ["std", "ext2"] }
+efs = { git = "https://github.com/dbittman/efs", features = ["std", "ext2"], branch = "twizzler-2025-04" }
 lru = "*"
 
 [dev-dependencies]

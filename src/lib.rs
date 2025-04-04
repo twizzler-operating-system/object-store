@@ -1,6 +1,5 @@
 #![feature(iterator_try_collect)]
 #![feature(slice_as_chunks)]
-#![feature(unsigned_is_multiple_of)]
 mod fs;
 mod kms;
 mod lethe_object_store;
