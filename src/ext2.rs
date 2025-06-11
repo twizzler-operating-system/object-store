@@ -141,6 +141,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
         offset: u64,
         buf: &mut [u8],
     ) -> std::io::Result<usize> {
+        tracing::debug!("read object: {}", id);
         let mut file = self.get_object_as_file(id)?;
         e2result_to_std(file.seek(SeekFrom::Start(offset)))?;
         e2result_to_std(file.read(buf))
@@ -236,10 +237,16 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
                 (end_req.start_page as u64 + end_req.nr_pages as u64) * P::page_size() as u64
             });
 
+        for r in reqs {
+            tracing::warn!(" PAGE OUT {} {}", r.start_page, r.nr_pages);
+        }
+
         let mut file = self.get_object_as_file(id)?;
+        tracing::warn!("POO: A2 {:?} {:?}", end_offset, file.size().0);
         if end_offset.unwrap_or(0) >= file.size().0 {
             self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
         }
+        tracing::warn!("POO: B");
         let blocks = self.with_inode(id, |inode, _, ext2| {
             let ib = e2result_to_std(inode.indirected_blocks(ext2))?;
             let blocks_per_page = P::page_size() / ext2.superblock().block_size() as usize;
@@ -259,6 +266,7 @@ impl<Device: efs::dev::Device<u8, Ext2Error>, P: PagingImp> PagedObjectStore<P>
                 .collect::<Vec<_>>();
             Ok(blocks)
         })?;
+        tracing::warn!("POO: C");
         tracing::debug!("paging request for {} reqs", reqs.len());
         for br in blocks {
             tracing::trace!("==> {:?}", br.1);

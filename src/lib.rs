@@ -6,6 +6,8 @@ mod lethe_object_store;
 mod wrapped_extent;
 
 mod ext2;
+mod ext4;
+pub use ext4::Ext4Store;
 pub mod paged_object_store;
 
 pub use ext2::Ext2ObjectStore;

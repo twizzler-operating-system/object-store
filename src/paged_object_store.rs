@@ -74,11 +74,18 @@ pub trait PagedObjectStore<P: PagingImp> {
     }
 
     fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest<P>]) -> Result<usize> {
+        tracing::warn!("PAGE IN");
         let mut buf = [0; PAGE_SIZE];
+        let len = self.len(id)?;
         for req in reqs.iter_mut() {
             for i in 0..req.nr_pages {
                 let page = req.start_page as usize + i as usize;
-                self.read_object(id, (page * PAGE_SIZE) as u64, &mut buf)?;
+                let start = (page * PAGE_SIZE) as u64;
+                if start >= len {
+                    buf.fill(0);
+                } else {
+                    self.read_object(id, (page * PAGE_SIZE) as u64, &mut buf)?;
+                }
                 req.imp.fill_from_buffer(&buf);
             }
         }
@@ -86,6 +93,7 @@ pub trait PagedObjectStore<P: PagingImp> {
     }
 
     fn page_out_object<'a>(&self, id: ObjID, reqs: &'a [PageRequest<P>]) -> Result<usize> {
+        tracing::warn!("PAGE OUT");
         let mut buf = [0; PAGE_SIZE];
         for req in reqs.iter() {
             for i in 0..req.nr_pages {
