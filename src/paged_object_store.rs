@@ -18,6 +18,15 @@ pub struct PhysRange {
 use std::io::Result;
 
 pub trait PagedDevice {
+    fn phys_addrs(
+        &self,
+        _start: Option<u64>,
+        _len: u64,
+        _allow_failed_alloc: bool,
+    ) -> Result<(PhysRange, bool)> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
     fn sequential_read(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
     fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
 
@@ -28,7 +37,7 @@ pub struct PageRequest {
     pub start_page: i64,
     pub nr_pages: u32,
     pub completed: u32,
-    pub phys_list: Vec<PhysRange>,
+    pub phys_list: Vec<(PhysRange, bool)>,
 }
 
 impl PageRequest {
@@ -41,7 +50,11 @@ impl PageRequest {
         }
     }
 
-    pub fn new_from_list(phys_list: Vec<PhysRange>, start_page: i64, nr_pages: u32) -> Self {
+    pub fn new_from_list(
+        phys_list: Vec<(PhysRange, bool)>,
+        start_page: i64,
+        nr_pages: u32,
+    ) -> Self {
         Self {
             start_page,
             phys_list,
@@ -50,11 +63,49 @@ impl PageRequest {
         }
     }
 
-    pub fn page_in(&self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<usize> {
+    pub fn into_list(self) -> Vec<(PhysRange, bool)> {
+        self.phys_list
+    }
+
+    fn setup_phys(&mut self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<()> {
+        for page in disk_pages {
+            let range = match device.phys_addrs(*page, PAGE_SIZE as u64, !self.phys_list.is_empty())
+            {
+                Ok(range) => range,
+                Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
+                    if self.phys_list.is_empty() {
+                        return Err(e);
+                    } else {
+                        self.nr_pages = self.phys_list.iter().fold(0u64, |acc, range| {
+                            acc + (range.0.end - range.0.start) / PAGE_SIZE as u64
+                        }) as u32;
+                        return Ok(());
+                    }
+                }
+                Err(e) => Err(e)?,
+            };
+            if range.1 {
+                self.completed += 1;
+            }
+            self.phys_list.push(range);
+        }
+
+        Ok(())
+    }
+
+    pub fn page_in(
+        &mut self,
+        disk_pages: &[Option<u64>],
+        device: &dyn PagedDevice,
+    ) -> Result<usize> {
+        self.setup_phys(disk_pages, device)?;
         let mut pairs = disk_pages
             .iter()
             .zip(&self.phys_list)
-            .filter_map(|(x, y)| if let Some(x) = x { Some((*x, y)) } else { None })
+            // Has disk pages to read
+            .filter_map(|x| x.0.map(|y| (y, x.1)))
+            // Has not completed
+            .filter_map(|x| if x.1 .1 { None } else { Some((x.0, x.1 .0)) })
             .collect::<Vec<_>>();
         pairs.sort_by_key(|p| p.0);
         let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
@@ -77,11 +128,18 @@ impl PageRequest {
         Ok(count)
     }
 
-    pub fn page_out(&self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<usize> {
+    pub fn page_out(
+        &mut self,
+        disk_pages: &[Option<u64>],
+        device: &dyn PagedDevice,
+    ) -> Result<usize> {
         let mut pairs = disk_pages
             .iter()
             .zip(&self.phys_list)
-            .filter_map(|(x, y)| if let Some(x) = x { Some((*x, y)) } else { None })
+            // Has disk pages to read
+            .filter_map(|x| x.0.map(|y| (y, x.1)))
+            // Has not completed
+            .filter_map(|x| if x.1 .1 { None } else { Some((x.0, x.1 .0)) })
             .collect::<Vec<_>>();
         pairs.sort_by_key(|p| p.0);
         let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
@@ -132,7 +190,7 @@ pub trait PagedObjectStore {
     fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 
     fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a [PageRequest]) -> Result<usize>;
+    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
 
     fn flush(&self) -> Result<()> {
         Ok(())
@@ -223,4 +281,9 @@ where
             None
         }
     })
+}
+
+pub trait PosIo {
+    fn read(&self, start: u64, buf: &mut [u8]) -> Result<usize>;
+    fn write(&self, start: u64, buf: &[u8]) -> Result<usize>;
 }

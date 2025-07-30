@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Mutex,
+        Arc, Mutex,
     },
 };
 
@@ -16,19 +16,20 @@ use twizzler::Result;
 
 use crate::{
     ino_to_objid, objid_to_ino, ExternalFile, ExternalKind, ObjID, PagedDevice, PagedObjectStore,
-    PAGE_SIZE,
+    PosIo, PAGE_SIZE,
 };
 
 pub struct Ext4Store {
     fs: Mutex<Ext4Fs>,
+    device: Arc<dyn Device>,
 }
 
-pub trait Device: Read + Write + Seek + PagedDevice {}
+pub trait Device: PosIo + PagedDevice + Sync + Send {}
 
-impl<T: Read + Write + Seek + PagedDevice> Device for T {}
+impl<T: PosIo + PagedDevice + Sync + Send> Device for T {}
 
 struct Ext4Bd {
-    device: Box<dyn Device>,
+    device: Arc<dyn Device>,
     phys_bcount: u64,
 }
 
@@ -52,24 +53,22 @@ impl Ext4BlockdevIface for Ext4Bd {
     fn read(&mut self, buf: *mut u8, block: u64, bcount: u32) -> std::io::Result<u32> {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
-        self.device.seek(SeekFrom::Start(start))?;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
-        let len = self.device.read(slice)?;
+        let len = self.device.read(start, slice)?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
     fn write(&mut self, buf: *const u8, block: u64, bcount: u32) -> std::io::Result<u32> {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
-        self.device.seek(SeekFrom::Start(start))?;
         let slice = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-        let len = self.device.write(slice)?;
+        let len = self.device.write(start, slice)?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 }
 
 impl Ext4Bd {
-    fn new(device: Box<dyn Device>, _name: &str, phys_bcount: u64) -> Self {
+    fn new(device: Arc<dyn Device>, _name: &str, phys_bcount: u64) -> Self {
         Self {
             device,
             phys_bcount,
@@ -94,13 +93,14 @@ const LOGICAL_BSIZE: u32 = 512;
 const PHYSICAL_BSIZE: u32 = 512;
 
 impl Ext4Store {
-    pub fn new<D: Device + 'static>(mut device: D, name: &str) -> Result<Self> {
+    pub fn new<D: Device + 'static>(device: D, name: &str) -> Result<Self> {
         let bdname = format!("blockdev-{}", BDEV_ID.fetch_add(1, Ordering::SeqCst));
-        let max = device.seek(SeekFrom::End(0))?;
+        let max = device.len()? as u64;
         let bcount = max / LOGICAL_BSIZE as u64;
         let phys_bcount = max / PHYSICAL_BSIZE as u64;
+        let device = Arc::new(device);
         let bd = Ext4Blockdev::new(
-            Ext4Bd::new(Box::new(device), bdname.as_str(), phys_bcount),
+            Ext4Bd::new(device.clone(), bdname.as_str(), phys_bcount),
             LOGICAL_BSIZE,
             bcount,
             name,
@@ -115,15 +115,10 @@ impl Ext4Store {
             _ => {}
         }
 
-        Ok(Self { fs: Mutex::new(fs) })
-    }
-
-    fn with_device<R>(&self, f: impl FnOnce(&mut dyn Device) -> R) -> R {
-        let mut fs = self.fs.lock().unwrap();
-        let iface = fs.bd().iface();
-        let any = &mut *iface as &mut dyn std::any::Any;
-        let bd = any.downcast_mut::<Ext4Bd>().unwrap();
-        f(&mut *bd.device)
+        Ok(Self {
+            fs: Mutex::new(fs),
+            device,
+        })
     }
 
     pub fn get_id_path(&self, id: ObjID) -> (String, String) {
@@ -211,38 +206,37 @@ impl PagedObjectStore for Ext4Store {
         let mut fs = self.fs.lock().unwrap();
         let mut inode = fs.get_file_inode(&file)?;
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
+        tracing::debug!("paging  in request for {} reqs", reqs.len());
         let blocks = reqs
-            .iter()
+            .iter_mut()
             .map(|req| {
-                (
-                    req,
-                    (req.start_page..(req.start_page + req.nr_pages as i64))
-                        .map(|p| {
-                            let mut block = p as u32;
-                            if objid_to_ino(id).is_some() {
-                                // External files don't have null pages
-                                block -= 1;
-                            }
-                            inode
-                                .get_data_block(block * blocks_per_page as u32, false)
-                                .ok()
-                        })
-                        .collect::<Vec<Option<u64>>>(),
-                )
+                let disk_pages = (req.start_page..(req.start_page + req.nr_pages as i64))
+                    .map(|p| {
+                        let mut block = p as u32;
+                        if objid_to_ino(id).is_some() {
+                            // External files don't have null pages
+                            block -= 1;
+                        }
+                        inode
+                            .get_data_block(block * blocks_per_page as u32, false)
+                            .ok()
+                    })
+                    .collect::<Vec<Option<u64>>>();
+                (req, disk_pages)
             })
             .collect::<Vec<_>>();
-        tracing::debug!("paging  in request for {} reqs", reqs.len());
+        drop(fs);
         for br in blocks {
             let mut pages = &br.1[..];
             while pages.len() > 0 {
-                let len = self.with_device(|dev| br.0.page_in(pages, dev))?;
+                let len = br.0.page_in(pages, &*self.device)?;
                 pages = &pages[len..];
             }
         }
         Ok(reqs.len())
     }
 
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a [crate::PageRequest]) -> Result<usize> {
+    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
         let end_offset = reqs
             .iter()
             .max_by_key(|req| req.start_page as u64 + req.nr_pages as u64)
@@ -258,26 +252,25 @@ impl PagedObjectStore for Ext4Store {
         let mut fs = self.fs.lock().unwrap();
         let mut inode = fs.get_file_inode(&file)?;
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
+        tracing::debug!("paging out request for {} reqs", reqs.len());
         let blocks = reqs
-            .iter()
+            .iter_mut()
             .map(|req| {
-                Ok::<_, std::io::Error>((
-                    req,
-                    (req.start_page..(req.start_page + req.nr_pages as i64))
-                        .map(|p| {
-                            inode
-                                .get_data_block(p as u32 * blocks_per_page as u32, true)
-                                .map(|p| Some(p))
-                        })
-                        .try_collect::<Vec<Option<u64>>>()?,
-                ))
+                let disk_pages = (req.start_page..(req.start_page + req.nr_pages as i64))
+                    .map(|p| {
+                        inode
+                            .get_data_block(p as u32 * blocks_per_page as u32, true)
+                            .map(|p| Some(p))
+                    })
+                    .try_collect::<Vec<Option<u64>>>()?;
+                Ok::<_, std::io::Error>((req, disk_pages))
             })
             .try_collect::<Vec<_>>()?;
-        tracing::debug!("paging out request for {} reqs", reqs.len());
+        drop(fs);
         for br in blocks {
             let mut pages = &br.1[..];
             while pages.len() > 0 {
-                let len = self.with_device(|dev| br.0.page_out(pages, dev))?;
+                let len = br.0.page_out(pages, &*self.device)?;
                 pages = &pages[len..];
             }
         }
