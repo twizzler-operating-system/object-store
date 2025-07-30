@@ -1,49 +1,111 @@
 pub type ObjID = u128;
 
 use core::str;
-use std::io::{ErrorKind, Result};
+use std::{io::ErrorKind, ops::Add};
 
 use obliviate_core::consts::PAGE_SIZE;
+#[cfg(target_os = "twizzler")]
+use twizzler::Result;
+#[cfg(target_os = "twizzler")]
+pub use twizzler_abi::pager::PhysRange;
 
-pub trait PagingImp {
-    type PhysAddr;
+#[cfg(not(target_os = "twizzler"))]
+pub struct PhysRange {
+    pub start: u64,
+    pub end: u64,
+}
+#[cfg(not(target_os = "twizzler"))]
+use std::io::Result;
 
-    fn page_size() -> usize {
-        PAGE_SIZE
-    }
+pub trait PagedDevice {
+    fn sequential_read(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
+    fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
 
-    fn fill_from_buffer(&self, buf: &[u8]);
-    fn read_to_buffer(&self, buf: &mut [u8]);
-
-    fn phys_addrs(&self) -> impl Iterator<Item = &'_ Self::PhysAddr>;
-
-    fn page_in(&self, _disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
-        todo!()
-    }
-
-    fn page_out(&self, _disk_pages: impl Iterator<Item = Option<u64>>) -> std::io::Result<usize> {
-        todo!()
-    }
+    fn len(&self) -> Result<usize>;
 }
 
-#[derive(Debug)]
-pub struct PageRequest<P: PagingImp> {
+pub struct PageRequest {
     pub start_page: i64,
-    pub imp: P,
     pub nr_pages: u32,
+    pub completed: u32,
+    pub phys_list: Vec<PhysRange>,
 }
 
-impl<P: PagingImp> PageRequest<P> {
-    pub fn new(imp: P, start_page: i64, nr_pages: u32) -> Self {
+impl PageRequest {
+    pub fn new(start_page: i64, nr_pages: u32) -> Self {
         Self {
             start_page,
-            imp,
+            phys_list: Vec::new(),
             nr_pages,
+            completed: 0,
         }
+    }
+
+    pub fn new_from_list(phys_list: Vec<PhysRange>, start_page: i64, nr_pages: u32) -> Self {
+        Self {
+            start_page,
+            phys_list,
+            nr_pages,
+            completed: 0,
+        }
+    }
+
+    pub fn page_in(&self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<usize> {
+        let mut pairs = disk_pages
+            .iter()
+            .zip(&self.phys_list)
+            .filter_map(|(x, y)| if let Some(x) = x { Some((*x, y)) } else { None })
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|p| p.0);
+        let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let mut offset = 0;
+        let runs = consecutive_slices(&dp).map(|run| {
+            let pair = (run, &pp[offset..(offset + run.len())]);
+            offset += run.len();
+            pair
+        });
+        let mut count = 0;
+        for (dp, mut pp) in runs {
+            let mut offset = 0;
+            while pp.len() > 0 {
+                let len = device.sequential_read(dp[0] + offset as u64, pp)?;
+                count += len;
+                offset += len;
+                pp = &pp[len..];
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn page_out(&self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<usize> {
+        let mut pairs = disk_pages
+            .iter()
+            .zip(&self.phys_list)
+            .filter_map(|(x, y)| if let Some(x) = x { Some((*x, y)) } else { None })
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|p| p.0);
+        let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        let mut offset = 0;
+        let runs = consecutive_slices(&dp).map(|run| {
+            let pair = (run, &pp[offset..(offset + run.len())]);
+            offset += run.len();
+            pair
+        });
+        let mut count = 0;
+        for (dp, mut pp) in runs {
+            let mut offset = 0;
+            while pp.len() > 0 {
+                let len = device.sequential_write(dp[0] + offset as u64, pp)?;
+                count += len;
+                offset += len;
+                pp = &pp[len..];
+            }
+        }
+        Ok(count)
     }
 }
 
-pub trait PagedObjectStore<P: PagingImp> {
+pub trait PagedObjectStore {
     fn get_config_id(&self) -> Result<ObjID> {
         let mut buf = [0; 16];
         self.read_object(0, 0, &mut buf).and_then(|len| {
@@ -69,47 +131,18 @@ pub trait PagedObjectStore<P: PagingImp> {
     fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 
+    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a [PageRequest]) -> Result<usize>;
+
     fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest<P>]) -> Result<usize> {
-        tracing::warn!("PAGE IN");
-        let mut buf = [0; PAGE_SIZE];
-        let len = self.len(id)?;
-        for req in reqs.iter_mut() {
-            for i in 0..req.nr_pages {
-                let page = req.start_page as usize + i as usize;
-                let start = (page * PAGE_SIZE) as u64;
-                if start >= len {
-                    buf.fill(0);
-                } else {
-                    self.read_object(id, (page * PAGE_SIZE) as u64, &mut buf)?;
-                }
-                req.imp.fill_from_buffer(&buf);
-            }
-        }
-        Ok(reqs.len())
-    }
-
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a [PageRequest<P>]) -> Result<usize> {
-        tracing::warn!("PAGE OUT");
-        let mut buf = [0; PAGE_SIZE];
-        for req in reqs.iter() {
-            for i in 0..req.nr_pages {
-                req.imp.read_to_buffer(&mut buf);
-                let page = req.start_page as usize + i as usize;
-                self.write_object(id, (page * PAGE_SIZE) as u64, &buf)?;
-            }
-        }
-        Ok(reqs.len())
-    }
-
-    fn enumerate_external(&self, _id: ObjID) -> std::io::Result<Vec<ExternalFile>> {
+    fn enumerate_external(&self, _id: ObjID) -> Result<Vec<ExternalFile>> {
         Err(ErrorKind::Unsupported.into())
     }
 
-    fn find_external(&self, _id: ObjID) -> std::io::Result<usize> {
+    fn find_external(&self, _id: ObjID) -> Result<usize> {
         Err(ErrorKind::Unsupported.into())
     }
 }
@@ -172,4 +205,22 @@ pub fn ino_to_objid(ino: u32) -> ObjID {
         return 1;
     }
     (1u128 << 127) | (ino as u128) | (1u128 << 63)
+}
+
+pub(crate) fn consecutive_slices<T: PartialEq + Add<u64> + Copy>(
+    data: &[T],
+) -> impl Iterator<Item = &[T]>
+where
+    T::Output: PartialEq<T>,
+{
+    let mut slice_start = 0;
+    (1..=data.len()).flat_map(move |i| {
+        if i == data.len() || data[i - 1] + 1u64 != data[i] {
+            let begin = slice_start;
+            slice_start = i;
+            Some(&data[begin..i])
+        } else {
+            None
+        }
+    })
 }

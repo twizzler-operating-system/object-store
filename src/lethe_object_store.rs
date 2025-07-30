@@ -1,3 +1,5 @@
+#[cfg(not(target_os = "twizzler"))]
+use std::io::Result;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
@@ -15,11 +17,13 @@ use fatfs::{
     SeekFrom, Write as _,
 };
 use obliviate_core::kms::{PersistableKeyManagementScheme, StableKeyManagementScheme};
+#[cfg(target_os = "twizzler")]
+use twizzler::Result;
 
 use crate::{
     fs::{Disk, FileSystem, PAGE_SIZE},
     kms::Kms,
-    paged_object_store::{PagedObjectStore, PagingImp},
+    paged_object_store::PagedObjectStore,
     wrapped_extent::WrappedExtent,
 };
 
@@ -37,7 +41,7 @@ pub struct LetheObjectStore<D: Disk> {
 fn get_dir_path<'a, D>(
     fs: &'a mut fatfs::FileSystem<D, DefaultTimeProvider, LossyOemCpConverter>,
     encoded_obj_id: &EncodedObjectId,
-) -> Result<Dir<'a, D, DefaultTimeProvider, LossyOemCpConverter>, Error>
+) -> Result<Dir<'a, D, DefaultTimeProvider, LossyOemCpConverter>>
 where
     D: Disk,
     std::io::Error: From<fatfs::Error<D::Error>>,
@@ -159,7 +163,7 @@ where
     /// # Safety
     /// If the disk gets corrupted then it might not securely delete
     /// what used to be on the disk.
-    pub fn open(disk: D, root_key: [u8; 32]) -> std::io::Result<Self> {
+    pub fn open(disk: D, root_key: [u8; 32]) -> Result<Self> {
         let fs = FileSystem::open_fs(disk)?;
         let fs_ref = fs.fs_as_owned();
         Self::restore_khf(&fs.fs().lock().unwrap());
@@ -172,7 +176,7 @@ where
     }
 
     /// Returns the disk length of a given object on disk.
-    pub fn disk_length(&self, obj_id: u128) -> Result<u64, Error> {
+    pub fn disk_length(&self, obj_id: u128) -> Result<u64> {
         let mut fs = self.fs().lock().unwrap();
         let id = encode_obj_id(obj_id);
         let dir = get_dir_path(&mut fs, &id)?;
@@ -181,7 +185,7 @@ where
         Ok(len)
     }
     /// Either gets a previously set config_id from disk or returns None
-    pub fn do_get_config_id(&self) -> Result<Option<u128>, Error> {
+    pub fn do_get_config_id(&self) -> Result<Option<u128>> {
         let fs = self.fs().lock().unwrap();
         let file = fs.root_dir().open_file("config_id");
         let mut file = match file {
@@ -194,7 +198,7 @@ where
         Ok(Some(u128::from_le_bytes(buf)))
     }
     /// Stores a config_id onto the disk.
-    pub fn do_set_config_id(&self, id: u128) -> Result<(), Error> {
+    pub fn do_set_config_id(&self, id: u128) -> Result<()> {
         let fs = self.fs().lock().unwrap();
         let mut file = fs.root_dir().create_file("config_id")?;
         file.truncate()?;
@@ -204,7 +208,7 @@ where
     }
 
     /// Returns true if file was created and false if the file already existed.
-    pub fn do_create_object(&self, obj_id: u128) -> Result<bool, Error> {
+    pub fn do_create_object(&self, obj_id: u128) -> Result<bool> {
         let b64 = encode_obj_id(obj_id);
         let mut fs = self.fs().lock().unwrap();
         let subdir = get_dir_path(&mut fs, &b64)?;
@@ -231,7 +235,7 @@ where
     /// # Safety
     /// To do secure deletion on deletes you must call an epoch
     /// before saving.
-    pub fn unlink_object(&self, obj_id: u128) -> Result<(), Error> {
+    pub fn unlink_object(&self, obj_id: u128) -> Result<()> {
         let b64 = encode_obj_id(obj_id);
         // let (khf, wal) = (kms.khf_mut(), kms.wal_mut());
         // khf.delete(&wal, hash_obj_id(obj_id))
@@ -256,7 +260,7 @@ where
         Ok(())
     }
 
-    pub fn get_all_object_ids(&self) -> Result<Vec<u128>, Error> {
+    pub fn get_all_object_ids(&self) -> Result<Vec<u128>> {
         let fs = self.fs().lock().unwrap();
         let id_root = fs.root_dir().create_dir("ids")?;
         let mut out = Vec::new();
@@ -277,7 +281,7 @@ where
         Ok(out)
     }
 
-    fn get_symmetric_cipher(&self, disk_offset: u64) -> Result<ChaCha20, Error> {
+    fn get_symmetric_cipher(&self, disk_offset: u64) -> Result<ChaCha20> {
         let kms = self.kms();
         let chunk_id = disk_offset_to_id(disk_offset);
         //println!("Chunk id: {}", chunk_id);
@@ -289,7 +293,7 @@ where
         get_symmetric_cipher_from_key(disk_offset, key)
     }
 
-    pub fn read_exact(&self, obj_id: u128, buf: &mut [u8], off: u64) -> Result<(), Error> {
+    pub fn read_exact(&self, obj_id: u128, buf: &mut [u8], off: u64) -> Result<()> {
         let b64 = encode_obj_id(obj_id);
         let mut fs = self.fs().lock().unwrap();
         let subdir = get_dir_path(&mut fs, &b64)?;
@@ -315,7 +319,7 @@ where
         Ok(())
     }
 
-    pub fn get_obj_segments(&self, obj_id: u128) -> Result<HashSet<WrappedExtent>, Error> {
+    pub fn get_obj_segments(&self, obj_id: u128) -> Result<HashSet<WrappedExtent>> {
         let b64 = encode_obj_id(obj_id);
         // call to get_khf_locks to make sure that khf is already initialized for
         // the later "get_symmetric_cipher" call
@@ -329,7 +333,7 @@ where
         Ok(out_hm)
     }
 
-    pub fn write_all(&self, obj_id: u128, buf: &[u8], off: u64) -> Result<(), Error> {
+    pub fn write_all(&self, obj_id: u128, buf: &[u8], off: u64) -> Result<()> {
         let b64 = encode_obj_id(obj_id);
         let mut fs = self.fs().lock().unwrap();
         let subdir = get_dir_path(&mut fs, &b64)?;
@@ -363,7 +367,7 @@ where
         Ok(())
     }
 
-    pub fn advance_epoch(&self) -> Result<(), Error> {
+    pub fn advance_epoch(&self) -> Result<()> {
         let kms = self.kms();
         let updated_keys = kms
             .khf_lock()
@@ -402,14 +406,14 @@ where
         Ok(())
     }
 
-    pub fn get_lethe_key_from_offset(&self, offset: u64) -> Result<[u8; 32], Error> {
+    pub fn get_lethe_key_from_offset(&self, offset: u64) -> Result<[u8; 32]> {
         let kms = self.kms();
         kms.khf_lock()
             .derive_mut(&kms.wal_lock(), disk_offset_to_id(offset))
             .map_err(|_| ErrorKind::Other.into())
     }
 
-    pub fn get_lethe_state(&self) -> Result<LetheState, Error> {
+    pub fn get_lethe_state(&self) -> Result<LetheState> {
         let mut objs = Vec::new();
         for id in self.get_all_object_ids()? {
             let mut perobj = PerObjLetheState::default();
@@ -486,7 +490,7 @@ pub fn id_to_disk_offset(id: u64) -> u64 {
 // // FIXME should use a randomly generated root key for each device.
 // pub const ROOT_KEY: [u8; 32] = [0; 32];
 
-fn get_symmetric_cipher_from_key(disk_offset: u64, key: [u8; 32]) -> Result<ChaCha20, Error> {
+fn get_symmetric_cipher_from_key(disk_offset: u64, key: [u8; 32]) -> Result<ChaCha20> {
     let chunk_id = disk_offset_to_id(disk_offset);
     let offset = disk_offset - chunk_id;
     let bytes = chunk_id.to_le_bytes();
@@ -499,7 +503,7 @@ fn get_symmetric_cipher_from_key(disk_offset: u64, key: [u8; 32]) -> Result<ChaC
     Ok(cipher)
 }
 
-impl<D: Disk, P: PagingImp> PagedObjectStore<P> for LetheObjectStore<D>
+impl<D: Disk> PagedObjectStore for LetheObjectStore<D>
 where
     D: Disk,
     std::io::Error: From<fatfs::Error<D::Error>>,
@@ -508,11 +512,11 @@ where
     std::io::Error: From<D::Error>,
     D::Error: std::error::Error + Send + Sync + 'static,
 {
-    fn create_object(&self, id: crate::paged_object_store::ObjID) -> std::io::Result<()> {
+    fn create_object(&self, id: crate::paged_object_store::ObjID) -> Result<()> {
         self.do_create_object(id).map(|_| ())
     }
 
-    fn delete_object(&self, id: crate::paged_object_store::ObjID) -> std::io::Result<()> {
+    fn delete_object(&self, id: crate::paged_object_store::ObjID) -> Result<()> {
         self.unlink_object(id)
     }
 
@@ -521,7 +525,7 @@ where
         id: crate::paged_object_store::ObjID,
         offset: u64,
         buf: &mut [u8],
-    ) -> std::io::Result<usize> {
+    ) -> Result<usize> {
         self.read_exact(id, buf, offset)?;
         Ok(buf.len())
     }
@@ -531,16 +535,32 @@ where
         id: crate::paged_object_store::ObjID,
         offset: u64,
         buf: &[u8],
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         self.write_all(id, buf, offset)
     }
 
-    fn flush(&self) -> std::io::Result<()> {
+    fn flush(&self) -> Result<()> {
         self.advance_epoch()
     }
 
-    fn len(&self, id: crate::ObjID) -> std::io::Result<u64> {
+    fn len(&self, id: crate::ObjID) -> Result<u64> {
         self.disk_length(id)
+    }
+
+    fn page_in_object<'a>(
+        &self,
+        _id: crate::ObjID,
+        _reqs: &'a mut [crate::PageRequest],
+    ) -> Result<usize> {
+        todo!()
+    }
+
+    fn page_out_object<'a>(
+        &self,
+        _id: crate::ObjID,
+        _reqs: &'a [crate::PageRequest],
+    ) -> Result<usize> {
+        todo!()
     }
 }
 
