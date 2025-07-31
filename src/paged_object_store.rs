@@ -10,6 +10,7 @@ use twizzler::Result;
 pub use twizzler_abi::pager::PhysRange;
 
 #[cfg(not(target_os = "twizzler"))]
+#[derive(Debug)]
 pub struct PhysRange {
     pub start: u64,
     pub end: u64,
@@ -33,6 +34,7 @@ pub trait PagedDevice {
     fn len(&self) -> Result<usize>;
 }
 
+#[derive(Debug)]
 pub struct PageRequest {
     pub start_page: i64,
     pub nr_pages: u32,
