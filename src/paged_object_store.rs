@@ -70,6 +70,9 @@ impl PageRequest {
     }
 
     fn setup_phys(&mut self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<()> {
+        // TODO: recover these
+        self.phys_list.clear();
+        self.completed = 0;
         for page in disk_pages {
             let range = match device.phys_addrs(*page, PAGE_SIZE as u64, !self.phys_list.is_empty())
             {
@@ -87,11 +90,13 @@ impl PageRequest {
                 Err(e) => Err(e)?,
             };
             if range.1 {
-                self.completed += 1;
+                self.completed += ((range.0.end - range.0.start) / PAGE_SIZE as u64) as u32;
             }
             self.phys_list.push(range);
         }
-
+        self.nr_pages = self.phys_list.iter().fold(0u64, |acc, range| {
+            acc + (range.0.end - range.0.start) / PAGE_SIZE as u64
+        }) as u32;
         Ok(())
     }
 
@@ -101,6 +106,9 @@ impl PageRequest {
         device: &dyn PagedDevice,
     ) -> Result<usize> {
         self.setup_phys(disk_pages, device)?;
+        if self.phys_list.iter().all(|p| p.1) {
+            return Ok(self.nr_pages as usize);
+        }
         let mut pairs = disk_pages
             .iter()
             .zip(&self.phys_list)
@@ -127,7 +135,7 @@ impl PageRequest {
                 pp = &pp[len..];
             }
         }
-        Ok(count)
+        Ok(count + self.completed as usize)
     }
 
     pub fn page_out(
