@@ -3,14 +3,13 @@ pub type ObjID = u128;
 use core::str;
 use std::{io::ErrorKind, ops::Add};
 
-use obliviate_core::consts::PAGE_SIZE;
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
 #[cfg(target_os = "twizzler")]
 pub use twizzler_abi::pager::PhysRange;
 
 #[cfg(not(target_os = "twizzler"))]
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PhysRange {
     pub start: u64,
     pub end: u64,
@@ -22,12 +21,38 @@ use crate::PAGE_SIZE;
 
 const PAGED_MEM_WIRED: u32 = 1;
 const PAGED_MEM_COMPLETED: u32 = 2;
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct PagedPhysMem {
     pub range: PhysRange,
     flags: u32,
 }
 
+impl core::ops::Add<u64> for PagedPhysMem {
+    type Output = Self;
+
+    fn add(self, rhs: u64) -> Self::Output {
+        if rhs == 0 {
+            Self {
+                range: self.range,
+                flags: self.flags,
+            }
+        } else {
+            Self {
+                range: PhysRange {
+                    start: self.range.end,
+                    end: self.range.end + PAGE_SIZE as u64,
+                },
+                flags: self.flags,
+            }
+        }
+    }
+}
+
 impl PagedPhysMem {
+    pub fn new(range: PhysRange) -> Self {
+        PagedPhysMem { range, flags: 0 }
+    }
+
     pub fn is_completed(&self) -> bool {
         self.flags & PAGED_MEM_COMPLETED != 0
     }
@@ -38,6 +63,16 @@ impl PagedPhysMem {
 
     pub fn set_completed(&mut self) {
         self.flags |= PAGED_MEM_COMPLETED;
+    }
+
+    pub fn completed(mut self) -> Self {
+        self.set_completed();
+        self
+    }
+
+    pub fn wired(mut self) -> Self {
+        self.set_wired();
+        self
     }
 
     pub fn set_wired(&mut self) {
@@ -53,6 +88,7 @@ impl PagedPhysMem {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 pub enum DevicePage {
     Run(u64, u32),
     Hole(u32),
@@ -60,20 +96,24 @@ pub enum DevicePage {
 
 impl DevicePage {
     pub fn try_extend(&mut self, other: &DevicePage) -> bool {
-        match (self, other) {
-            (&mut Hole(len1), &Hole(len2)) => {
-                *self = Hole(len1 + len2);
-                true
+        let new_val = match (*self, other) {
+            (DevicePage::Hole(len1), &DevicePage::Hole(len2)) => {
+                Some(DevicePage::Hole(len1 + len2))
             }
-            (&mut Run(start1, len1), &Run(start2, len2)) => {
-                if start1 + *len1 as u64 == *start2 {
-                    *self = Run(start1, len1 + len2);
-                    true
+            (DevicePage::Run(start1, len1), &DevicePage::Run(start2, len2)) => {
+                if start1 + len1 as u64 == start2 {
+                    Some(DevicePage::Run(start1, len1 + len2))
                 } else {
-                    false
+                    None
                 }
             }
-            _ => false,
+            _ => None,
+        };
+        if let Some(new_val) = new_val {
+            *self = new_val;
+            true
+        } else {
+            false
         }
     }
 
@@ -82,6 +122,31 @@ impl DevicePage {
             DevicePage::Run(_, len) => *len as usize,
             DevicePage::Hole(len) => *len as usize,
         }
+    }
+
+    pub fn as_hole(&self) -> Option<u32> {
+        match self {
+            DevicePage::Hole(len) => Some(*len),
+            _ => None,
+        }
+    }
+
+    pub fn offset(&mut self, avail_len: &mut usize) {
+        let new = match self {
+            DevicePage::Run(start, len) => {
+                let new_len = len.saturating_sub(*avail_len as u32);
+                let diff = *len - new_len;
+                *avail_len = diff as usize;
+                DevicePage::Run(*start + diff as u64, new_len)
+            }
+            DevicePage::Hole(len) => {
+                let new_len = len.saturating_sub(*avail_len as u32);
+                let diff = *len - new_len;
+                *avail_len = diff as usize;
+                DevicePage::Hole(new_len)
+            }
+        };
+        *self = new;
     }
 }
 
@@ -157,9 +222,8 @@ mod tests {
 }
 
 pub trait PagedDevice {
-    /// Append the needed paged phys mem for this device page, return the number of appended paged
-    /// phys mem structs.
-    fn phys_addrs(&self, _start: DevicePage, phys_list: &mut Vec<PagedPhysMem>) -> Result<usize> {
+    /// Append the needed paged phys mem for this device page, return the number of appended pages.
+    fn phys_addrs(&self, _start: DevicePage, _phys_list: &mut Vec<PagedPhysMem>) -> Result<usize> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
@@ -204,28 +268,37 @@ impl PageRequest {
         // TODO: recover these
         self.phys_list.clear();
         for page in disk_pages {
-            match device.phys_addrs(*page, &mut self.phys_list) {
-                Ok(_) => {}
-                Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
-                    if self.phys_list.is_empty() {
-                        return Err(e);
-                    } else {
-                        break;
+            let mut count = 0;
+            while count < page.nr_pages() {
+                match device.phys_addrs(*page, &mut self.phys_list) {
+                    Ok(r) => {
+                        count += r;
                     }
+                    Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
+                        if self.phys_list.is_empty() {
+                            return Err(e);
+                        } else {
+                            break;
+                        }
+                    }
+                    Err(e) => Err(e)?,
                 }
-                Err(e) => Err(e)?,
+            }
+
+            if count < page.nr_pages() {
+                break;
             }
         }
 
-        self.nr_pages = self
-            .phys_list
-            .iter()
-            .fold(0u64, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
-        self.completed = self
-            .phys_list
-            .iter()
-            .filter(|p| p.is_completed())
-            .fold(0u64, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
+        self.nr_pages =
+            self.phys_list
+                .iter()
+                .fold(0usize, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
+        self.completed =
+            self.phys_list
+                .iter()
+                .filter(|p| p.is_completed())
+                .fold(0usize, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
         Ok(())
     }
 
@@ -235,37 +308,9 @@ impl PageRequest {
         device: &dyn PagedDevice,
     ) -> Result<usize> {
         self.setup_phys(disk_pages, device)?;
-        if self.phys_list.iter().all(|p| p.1) {
+        if self.phys_list.iter().all(|p| p.is_completed()) {
             return Ok(self.nr_pages as usize);
         }
-        /*
-        let mut pairs = disk_pages
-            .iter()
-            .zip(&self.phys_list)
-            // Has disk pages to read
-            .filter_map(|x| x.0.map(|y| (y, x.1)))
-            // Has not completed
-            .filter_map(|x| if x.1 .1 { None } else { Some((x.0, x.1 .0)) })
-            .collect::<Vec<_>>();
-        pairs.sort_by_key(|p| p.0);
-        let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-        let mut offset = 0;
-        let runs = consecutive_slices(&dp).map(|run| {
-            let pair = (run, &pp[offset..(offset + run.len())]);
-            offset += run.len();
-            pair
-        });
-        let mut count = 0;
-        for (dp, mut pp) in runs {
-            let mut offset = 0;
-            while pp.len() > 0 {
-                let len = device.sequential_read(dp[0] + offset as u64, pp)?;
-                count += len;
-                offset += len;
-                pp = &pp[len..];
-            }
-        }
-        */
 
         let mut cursor = 0;
         let mut inner_cursor = 0;
@@ -279,12 +324,15 @@ impl PageRequest {
                     .min(self.phys_list[cursor].nr_pages() - inner_cursor);
 
                 let new_range = PhysRange {
-                    start: self.phys_list[cursor].range.start + inner_cursor * PAGE_SIZE,
-                    end: self.phys_list[cursor].range.start + inner_cursor * PAGE_SIZE + thislen,
+                    start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
+                    end: self.phys_list[cursor].range.start
+                        + (inner_cursor * PAGE_SIZE) as u64
+                        + (thislen * PAGE_SIZE) as u64,
                 };
 
                 tmp.push(new_range);
 
+                inner_cursor += thislen;
                 if inner_cursor >= self.phys_list[cursor].nr_pages() {
                     cursor += 1;
                     inner_cursor = 0;
@@ -296,15 +344,19 @@ impl PageRequest {
                 count += thislen;
             }
 
-            if let DevicePage::Run(start, len) = disk_page {
-                let mut tmp = tmp.as_slice();
-                while tmp.len() > 0 {
-                    let r = device.sequential_read(start, tmp.as_slice())?;
-                    tmp = &tmp[r.len()..];
+            if let DevicePage::Run(start, _len) = disk_page {
+                let mut count = 0;
+                while count < tmp.len() {
+                    let r = device.sequential_read(*start + count as u64, &tmp[count..])?;
+                    count += r;
                 }
             }
 
             tfer_count += count;
+
+            if cursor >= self.phys_list.len() {
+                break;
+            }
         }
 
         Ok(tfer_count)
@@ -315,33 +367,54 @@ impl PageRequest {
         disk_pages: &[DevicePage],
         device: &dyn PagedDevice,
     ) -> Result<usize> {
-        let mut pairs = disk_pages
-            .iter()
-            .zip(&self.phys_list)
-            // Has disk pages to read
-            .filter_map(|x| x.0.map(|y| (y, x.1)))
-            // Has not completed
-            .filter_map(|x| if x.1 .1 { None } else { Some((x.0, x.1 .0)) })
-            .collect::<Vec<_>>();
-        pairs.sort_by_key(|p| p.0);
-        let (dp, pp): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
-        let mut offset = 0;
-        let runs = consecutive_slices(&dp).map(|run| {
-            let pair = (run, &pp[offset..(offset + run.len())]);
-            offset += run.len();
-            pair
-        });
-        let mut count = 0;
-        for (dp, mut pp) in runs {
-            let mut offset = 0;
-            while pp.len() > 0 {
-                let len = device.sequential_write(dp[0] + offset as u64, pp)?;
-                count += len;
-                offset += len;
-                pp = &pp[len..];
+        let mut cursor = 0;
+        let mut inner_cursor = 0;
+        let mut tfer_count = 0;
+        let mut tmp: Vec<PhysRange> = Vec::new();
+        for disk_page in disk_pages {
+            let mut count = 0;
+            tmp.clear();
+            while count < disk_page.nr_pages() {
+                let thislen = (disk_page.nr_pages() - count)
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+
+                let new_range = PhysRange {
+                    start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
+                    end: self.phys_list[cursor].range.start
+                        + (inner_cursor * PAGE_SIZE) as u64
+                        + (thislen * PAGE_SIZE) as u64,
+                };
+
+                tmp.push(new_range);
+
+                inner_cursor += thislen;
+                if inner_cursor >= self.phys_list[cursor].nr_pages() {
+                    cursor += 1;
+                    inner_cursor = 0;
+                    if cursor >= self.phys_list.len() {
+                        break;
+                    }
+                }
+
+                count += thislen;
+            }
+
+            if let DevicePage::Run(start, _len) = disk_page {
+                let mut count = 0;
+                while count < tmp.len() {
+                    let r = device.sequential_write(*start + count as u64, &tmp[count..])?;
+                    count += r;
+                }
+            }
+
+            tfer_count += count;
+
+            if cursor >= self.phys_list.len() {
+                break;
             }
         }
-        Ok(count)
+
+        Ok(tfer_count)
     }
 }
 
@@ -447,7 +520,7 @@ pub fn ino_to_objid(ino: u32) -> ObjID {
     (1u128 << 127) | (ino as u128) | (1u128 << 63)
 }
 
-pub(crate) fn consecutive_slices<T: PartialEq + Add<u64> + Copy>(
+pub(crate) fn _consecutive_slices<T: PartialEq + Add<u64> + Copy>(
     data: &[T],
 ) -> impl Iterator<Item = &[T]>
 where

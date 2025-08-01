@@ -15,8 +15,8 @@ use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, O_C
 use twizzler::Result;
 
 use crate::{
-    ino_to_objid, objid_to_ino, ExternalFile, ExternalKind, ObjID, PagedDevice, PagedObjectStore,
-    PosIo, PAGE_SIZE,
+    ino_to_objid, objid_to_ino, DevicePage, ExternalFile, ExternalKind, ObjID, PagedDevice,
+    PagedObjectStore, PosIo, PAGE_SIZE,
 };
 
 pub struct Ext4Store {
@@ -207,42 +207,35 @@ impl PagedObjectStore for Ext4Store {
         let mut inode = fs.get_file_inode(&file)?;
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         tracing::debug!("paging  in request for {} reqs", reqs.len());
-        let blocks = reqs
+        let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut disk_pages = Vec::new();
-                for page in (req.start_page..(req.start_page + req.nr_pages as i64)) {
-                    let mut block = p as u32;
+                let mut disk_pages = Vec::<DevicePage>::new();
+                for page in req.start_page..(req.start_page + req.nr_pages as i64) {
+                    let mut block = page as u32;
                     if objid_to_ino(id).is_some() {
                         // External files don't have null pages
                         block -= 1;
                     }
-                    let item = match inode
-                        .get_data_block(block * blocks_per_page as u32, false)
-                        .ok()
-                    {
-                        None => {}
-                        Some(0) => {}
-                        Some(dpg) => {}
+                    let item = match inode.get_data_block(block * blocks_per_page as u32, false)? {
+                        0 => DevicePage::Hole(1),
+                        dpg => DevicePage::Run(dpg, 1),
                     };
                     if let Some(prev) = disk_pages.last_mut() {
-                        if !prev.try_extend(item) {
+                        if !prev.try_extend(&item) {
                             disk_pages.push(item);
                         }
                     } else {
                         disk_pages.push(item);
                     }
                 }
-                (req, disk_pages)
+                Result::Ok((req, disk_pages))
             })
-            .collect::<Vec<_>>();
+            .try_collect::<Vec<_>>()?;
         drop(fs);
-        for br in blocks {
-            let mut pages = &br.1[..];
-            while pages.len() > 0 {
-                let len = br.0.page_in(pages, &*self.device)?;
-                pages = &pages[len..];
-            }
+        for br in blocks.iter_mut() {
+            let pages = &br.1[..];
+            let _len = br.0.page_in(pages, &*self.device)?;
         }
         Ok(reqs.len())
     }
@@ -264,26 +257,37 @@ impl PagedObjectStore for Ext4Store {
         let mut inode = fs.get_file_inode(&file)?;
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         tracing::debug!("paging out request for {} reqs", reqs.len());
-        let blocks = reqs
+
+        let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let disk_pages = (req.start_page..(req.start_page + req.nr_pages as i64))
-                    .map(|p| {
-                        inode
-                            .get_data_block(p as u32 * blocks_per_page as u32, true)
-                            .map(|p| Some(p))
-                    })
-                    .try_collect::<Vec<Option<u64>>>()?;
-                Ok::<_, std::io::Error>((req, disk_pages))
+                let mut disk_pages = Vec::<DevicePage>::new();
+                for page in req.start_page..(req.start_page + req.nr_pages as i64) {
+                    let mut block = page as u32;
+                    if objid_to_ino(id).is_some() {
+                        // External files don't have null pages
+                        block -= 1;
+                    }
+                    let item = match inode.get_data_block(block * blocks_per_page as u32, true)? {
+                        0 => Result::Err(ErrorKind::Other.into())?,
+                        dpg => DevicePage::Run(dpg, 1),
+                    };
+                    if let Some(prev) = disk_pages.last_mut() {
+                        if !prev.try_extend(&item) {
+                            disk_pages.push(item);
+                        }
+                    } else {
+                        disk_pages.push(item);
+                    }
+                }
+                Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_>>()?;
+
         drop(fs);
-        for br in blocks {
-            let mut pages = &br.1[..];
-            while pages.len() > 0 {
-                let len = br.0.page_out(pages, &*self.device)?;
-                pages = &pages[len..];
-            }
+        for br in blocks.iter_mut() {
+            let pages = &br.1[..];
+            let _len = br.0.page_out(pages, &*self.device)?;
         }
         Ok(reqs.len())
     }
