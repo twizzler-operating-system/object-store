@@ -18,13 +18,148 @@ pub struct PhysRange {
 #[cfg(not(target_os = "twizzler"))]
 use std::io::Result;
 
+use crate::PAGE_SIZE;
+
+const PAGED_MEM_WIRED: u32 = 1;
+const PAGED_MEM_COMPLETED: u32 = 2;
+pub struct PagedPhysMem {
+    pub range: PhysRange,
+    flags: u32,
+}
+
+impl PagedPhysMem {
+    pub fn is_completed(&self) -> bool {
+        self.flags & PAGED_MEM_COMPLETED != 0
+    }
+
+    pub fn is_wired(&self) -> bool {
+        self.flags & PAGED_MEM_WIRED != 0
+    }
+
+    pub fn set_completed(&mut self) {
+        self.flags |= PAGED_MEM_COMPLETED;
+    }
+
+    pub fn set_wired(&mut self) {
+        self.flags |= PAGED_MEM_WIRED;
+    }
+
+    pub fn len(&self) -> usize {
+        (self.range.end - self.range.start) as usize
+    }
+
+    pub fn nr_pages(&self) -> usize {
+        self.len() / PAGE_SIZE
+    }
+}
+
+pub enum DevicePage {
+    Run(u64, u32),
+    Hole(u32),
+}
+
+impl DevicePage {
+    pub fn try_extend(&mut self, other: &DevicePage) -> bool {
+        match (self, other) {
+            (&mut Hole(len1), &Hole(len2)) => {
+                *self = Hole(len1 + len2);
+                true
+            }
+            (&mut Run(start1, len1), &Run(start2, len2)) => {
+                if start1 + *len1 as u64 == *start2 {
+                    *self = Run(start1, len1 + len2);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn nr_pages(&self) -> usize {
+        match self {
+            DevicePage::Run(_, len) => *len as usize,
+            DevicePage::Hole(len) => *len as usize,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_extend_holes() {
+        let mut hole1 = DevicePage::Hole(10);
+        let hole2 = DevicePage::Hole(5);
+
+        assert!(hole1.try_extend(&hole2));
+        match hole1 {
+            DevicePage::Hole(len) => assert_eq!(len, 15),
+            _ => panic!("Expected Hole"),
+        }
+    }
+
+    #[test]
+    fn test_try_extend_consecutive_runs() {
+        let mut run1 = DevicePage::Run(100, 10);
+        let run2 = DevicePage::Run(110, 5);
+
+        assert!(run1.try_extend(&run2));
+        match run1 {
+            DevicePage::Run(start, len) => {
+                assert_eq!(start, 100);
+                assert_eq!(len, 15);
+            }
+            _ => panic!("Expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_try_extend_non_consecutive_runs() {
+        let mut run1 = DevicePage::Run(100, 10);
+        let run2 = DevicePage::Run(120, 5);
+
+        assert!(!run1.try_extend(&run2));
+        match run1 {
+            DevicePage::Run(start, len) => {
+                assert_eq!(start, 100);
+                assert_eq!(len, 10); // Should remain unchanged
+            }
+            _ => panic!("Expected Run"),
+        }
+    }
+
+    #[test]
+    fn test_try_extend_mixed_types() {
+        let mut hole = DevicePage::Hole(10);
+        let run = DevicePage::Run(100, 5);
+
+        assert!(!hole.try_extend(&run));
+        match hole {
+            DevicePage::Hole(len) => assert_eq!(len, 10), // Should remain unchanged
+            _ => panic!("Expected Hole"),
+        }
+
+        let mut run = DevicePage::Run(100, 10);
+        let hole = DevicePage::Hole(5);
+
+        assert!(!run.try_extend(&hole));
+        match run {
+            DevicePage::Run(start, len) => {
+                assert_eq!(start, 100);
+                assert_eq!(len, 10); // Should remain unchanged
+            }
+            _ => panic!("Expected Run"),
+        }
+    }
+}
+
 pub trait PagedDevice {
-    fn phys_addrs(
-        &self,
-        _start: Option<u64>,
-        _len: u64,
-        _allow_failed_alloc: bool,
-    ) -> Result<(PhysRange, bool)> {
+    /// Append the needed paged phys mem for this device page, return the number of appended paged
+    /// phys mem structs.
+    fn phys_addrs(&self, _start: DevicePage, phys_list: &mut Vec<PagedPhysMem>) -> Result<usize> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
@@ -39,7 +174,7 @@ pub struct PageRequest {
     pub start_page: i64,
     pub nr_pages: u32,
     pub completed: u32,
-    pub phys_list: Vec<(PhysRange, bool)>,
+    pub phys_list: Vec<PagedPhysMem>,
 }
 
 impl PageRequest {
@@ -52,11 +187,7 @@ impl PageRequest {
         }
     }
 
-    pub fn new_from_list(
-        phys_list: Vec<(PhysRange, bool)>,
-        start_page: i64,
-        nr_pages: u32,
-    ) -> Self {
+    pub fn new_from_list(phys_list: Vec<PagedPhysMem>, start_page: i64, nr_pages: u32) -> Self {
         Self {
             start_page,
             phys_list,
@@ -65,50 +196,49 @@ impl PageRequest {
         }
     }
 
-    pub fn into_list(self) -> Vec<(PhysRange, bool)> {
+    pub fn into_list(self) -> Vec<PagedPhysMem> {
         self.phys_list
     }
 
-    fn setup_phys(&mut self, disk_pages: &[Option<u64>], device: &dyn PagedDevice) -> Result<()> {
+    fn setup_phys(&mut self, disk_pages: &[DevicePage], device: &dyn PagedDevice) -> Result<()> {
         // TODO: recover these
         self.phys_list.clear();
-        self.completed = 0;
         for page in disk_pages {
-            let range = match device.phys_addrs(*page, PAGE_SIZE as u64, !self.phys_list.is_empty())
-            {
-                Ok(range) => range,
+            match device.phys_addrs(*page, &mut self.phys_list) {
+                Ok(_) => {}
                 Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
                     if self.phys_list.is_empty() {
                         return Err(e);
                     } else {
-                        self.nr_pages = self.phys_list.iter().fold(0u64, |acc, range| {
-                            acc + (range.0.end - range.0.start) / PAGE_SIZE as u64
-                        }) as u32;
-                        return Ok(());
+                        break;
                     }
                 }
                 Err(e) => Err(e)?,
-            };
-            if range.1 {
-                self.completed += ((range.0.end - range.0.start) / PAGE_SIZE as u64) as u32;
             }
-            self.phys_list.push(range);
         }
-        self.nr_pages = self.phys_list.iter().fold(0u64, |acc, range| {
-            acc + (range.0.end - range.0.start) / PAGE_SIZE as u64
-        }) as u32;
+
+        self.nr_pages = self
+            .phys_list
+            .iter()
+            .fold(0u64, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
+        self.completed = self
+            .phys_list
+            .iter()
+            .filter(|p| p.is_completed())
+            .fold(0u64, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
         Ok(())
     }
 
     pub fn page_in(
         &mut self,
-        disk_pages: &[Option<u64>],
+        disk_pages: &[DevicePage],
         device: &dyn PagedDevice,
     ) -> Result<usize> {
         self.setup_phys(disk_pages, device)?;
         if self.phys_list.iter().all(|p| p.1) {
             return Ok(self.nr_pages as usize);
         }
+        /*
         let mut pairs = disk_pages
             .iter()
             .zip(&self.phys_list)
@@ -135,12 +265,54 @@ impl PageRequest {
                 pp = &pp[len..];
             }
         }
-        Ok(count + self.completed as usize)
+        */
+
+        let mut cursor = 0;
+        let mut inner_cursor = 0;
+        let mut tfer_count = 0;
+        let mut tmp: Vec<PhysRange> = Vec::new();
+        for disk_page in disk_pages {
+            let mut count = 0;
+            tmp.clear();
+            while count < disk_page.nr_pages() {
+                let thislen = (disk_page.nr_pages() - count)
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+
+                let new_range = PhysRange {
+                    start: self.phys_list[cursor].range.start + inner_cursor * PAGE_SIZE,
+                    end: self.phys_list[cursor].range.start + inner_cursor * PAGE_SIZE + thislen,
+                };
+
+                tmp.push(new_range);
+
+                if inner_cursor >= self.phys_list[cursor].nr_pages() {
+                    cursor += 1;
+                    inner_cursor = 0;
+                    if cursor >= self.phys_list.len() {
+                        break;
+                    }
+                }
+
+                count += thislen;
+            }
+
+            if let DevicePage::Run(start, len) = disk_page {
+                let mut tmp = tmp.as_slice();
+                while tmp.len() > 0 {
+                    let r = device.sequential_read(start, tmp.as_slice())?;
+                    tmp = &tmp[r.len()..];
+                }
+            }
+
+            tfer_count += count;
+        }
+
+        Ok(tfer_count)
     }
 
     pub fn page_out(
         &mut self,
-        disk_pages: &[Option<u64>],
+        disk_pages: &[DevicePage],
         device: &dyn PagedDevice,
     ) -> Result<usize> {
         let mut pairs = disk_pages

@@ -210,18 +210,29 @@ impl PagedObjectStore for Ext4Store {
         let blocks = reqs
             .iter_mut()
             .map(|req| {
-                let disk_pages = (req.start_page..(req.start_page + req.nr_pages as i64))
-                    .map(|p| {
-                        let mut block = p as u32;
-                        if objid_to_ino(id).is_some() {
-                            // External files don't have null pages
-                            block -= 1;
+                let mut disk_pages = Vec::new();
+                for page in (req.start_page..(req.start_page + req.nr_pages as i64)) {
+                    let mut block = p as u32;
+                    if objid_to_ino(id).is_some() {
+                        // External files don't have null pages
+                        block -= 1;
+                    }
+                    let item = match inode
+                        .get_data_block(block * blocks_per_page as u32, false)
+                        .ok()
+                    {
+                        None => {}
+                        Some(0) => {}
+                        Some(dpg) => {}
+                    };
+                    if let Some(prev) = disk_pages.last_mut() {
+                        if !prev.try_extend(item) {
+                            disk_pages.push(item);
                         }
-                        inode
-                            .get_data_block(block * blocks_per_page as u32, false)
-                            .ok()
-                    })
-                    .collect::<Vec<Option<u64>>>();
+                    } else {
+                        disk_pages.push(item);
+                    }
+                }
                 (req, disk_pages)
             })
             .collect::<Vec<_>>();
