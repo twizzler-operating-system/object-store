@@ -95,6 +95,25 @@ pub enum DevicePage {
 }
 
 impl DevicePage {
+    pub fn from_array(array: &[u64]) -> Vec<Self> {
+        let mut tmp = Vec::<Self>::new();
+        for item in array {
+            let item = if *item == 0 {
+                DevicePage::Hole(1)
+            } else {
+                DevicePage::Run(*item, 1)
+            };
+            if let Some(prev) = tmp.last_mut() {
+                if !prev.try_extend(&item) {
+                    tmp.push(item);
+                }
+            } else {
+                tmp.push(item);
+            }
+        }
+        tmp
+    }
+
     pub fn try_extend(&mut self, other: &DevicePage) -> bool {
         let new_val = match (*self, other) {
             (DevicePage::Hole(len1), &DevicePage::Hole(len2)) => {

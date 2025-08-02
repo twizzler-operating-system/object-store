@@ -211,16 +211,33 @@ impl PagedObjectStore for Ext4Store {
             .iter_mut()
             .map(|req| {
                 let mut disk_pages = Vec::<DevicePage>::new();
-                for page in req.start_page..(req.start_page + req.nr_pages as i64) {
+
+                let mut page = req.start_page;
+                let end = req.start_page + req.nr_pages as i64;
+
+                while page < end {
                     let mut block = page as u32;
                     if objid_to_ino(id).is_some() {
                         // External files don't have null pages
                         block -= 1;
                     }
-                    let item = match inode.get_data_block(block * blocks_per_page as u32, false)? {
-                        0 => DevicePage::Hole(1),
-                        dpg => DevicePage::Run(dpg, 1),
+                    block = block * blocks_per_page as u32;
+                    let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
+
+                    let item = match inode.get_data_blocks(block, rem_blocks, false) {
+                        Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
+                            if dblock == 0 {
+                                DevicePage::Hole(nr_dblk)
+                            } else {
+                                DevicePage::Run(dblock, nr_dblk)
+                            }
+                        }
+                        _ => match inode.get_data_block(block, false)? {
+                            0 => DevicePage::Hole(1),
+                            dpg => DevicePage::Run(dpg, 1),
+                        },
                     };
+                    page += item.nr_pages() as i64;
                     if let Some(prev) = disk_pages.last_mut() {
                         if !prev.try_extend(&item) {
                             disk_pages.push(item);
@@ -237,6 +254,7 @@ impl PagedObjectStore for Ext4Store {
             let pages = &br.1[..];
             let _len = br.0.page_in(pages, &*self.device)?;
         }
+
         Ok(reqs.len())
     }
 
