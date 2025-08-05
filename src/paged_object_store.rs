@@ -291,6 +291,9 @@ impl PageRequest {
             while count < page.nr_pages() {
                 match device.phys_addrs(*page, &mut self.phys_list) {
                     Ok(r) => {
+                        if r == 0 {
+                            break;
+                        }
                         count += r;
                     }
                     Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
