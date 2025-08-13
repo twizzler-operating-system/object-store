@@ -5,7 +5,7 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
+        Arc, Condvar, Mutex, MutexGuard,
     },
 };
 
@@ -31,6 +31,8 @@ impl<T: PosIo + PagedDevice + Sync + Send> Device for T {}
 struct Ext4Bd {
     device: Arc<dyn Device>,
     phys_bcount: u64,
+    lock: Mutex<bool>,
+    cv: Condvar,
 }
 
 impl Ext4BlockdevIface for Ext4Bd {
@@ -65,6 +67,23 @@ impl Ext4BlockdevIface for Ext4Bd {
         let len = self.device.write(start, slice)?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
+
+    fn lock(&self) -> std::io::Result<()> {
+        let mut inner = self.lock.lock().unwrap();
+        while *inner {
+            inner = self.cv.wait(inner).unwrap();
+        }
+        *inner = true;
+        Ok(())
+    }
+
+    fn unlock(&self) -> std::io::Result<()> {
+        let mut inner = self.lock.lock().unwrap();
+        assert!(*inner);
+        *inner = false;
+        self.cv.notify_all();
+        Ok(())
+    }
 }
 
 impl Ext4Bd {
@@ -72,6 +91,8 @@ impl Ext4Bd {
         Self {
             device,
             phys_bcount,
+            lock: Mutex::new(false),
+            cv: Condvar::new(),
         }
     }
 }
@@ -127,14 +148,17 @@ impl Ext4Store {
         (us, format!("ids/{:x}/{:x}", top, id))
     }
 
-    pub fn get_object_as_file(&self, id: ObjID, create: bool) -> Result<Ext4File> {
+    pub fn get_object_as_file<'a>(
+        &self,
+        fs: &'a mut MutexGuard<'_, Ext4Fs>,
+        id: ObjID,
+        create: bool,
+    ) -> Result<Ext4File<'a>> {
         let flags = if create { O_RDWR | O_CREAT } else { O_RDWR };
         if let Some(ino) = objid_to_ino(id) {
-            let mut fs = self.fs.lock().unwrap();
             return Ok(fs.open_file_from_inode(ino, flags)?);
         }
         let path = self.get_id_path(id);
-        let mut fs = self.fs.lock().unwrap();
         if create {
             match fs.create_dir(&path.0) {
                 Ok(_) => {}
@@ -148,7 +172,8 @@ impl Ext4Store {
 
 impl PagedObjectStore for Ext4Store {
     fn create_object(&self, id: crate::ObjID) -> Result<()> {
-        self.get_object_as_file(id, true)?;
+        let mut fs = self.fs.lock().unwrap();
+        self.get_object_as_file(&mut fs, id, true)?;
         Ok(())
     }
 
@@ -158,20 +183,23 @@ impl PagedObjectStore for Ext4Store {
     }
 
     fn len(&self, id: crate::ObjID) -> Result<u64> {
-        let mut file = self.get_object_as_file(id, false)?;
+        let mut fs = self.fs.lock().unwrap();
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
         Ok(file.len())
     }
 
     fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut file = self.get_object_as_file(id, false)?;
+        let mut fs = self.fs.lock().unwrap();
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(file.read(buf)?)
     }
 
     fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
-        let mut file = self.get_object_as_file(id, false)?;
+        let mut fs = self.fs.lock().unwrap();
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if offset > file.len() {
-            self.fs.lock().unwrap().ensure_backing(&file, offset)?;
+            file.ensure_backing(offset)?;
             file.truncate(offset)?;
         }
         file.seek(SeekFrom::Start(offset))?;
@@ -202,10 +230,10 @@ impl PagedObjectStore for Ext4Store {
     }
 
     fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
-        let file = self.get_object_as_file(id, false)?;
         let mut fs = self.fs.lock().unwrap();
-        let mut inode = fs.get_file_inode(&file)?;
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
+        let mut inode = file.get_file_inode()?;
         tracing::debug!("paging  in request for {} reqs", reqs.len());
         let mut blocks = reqs
             .iter_mut()
@@ -249,6 +277,7 @@ impl PagedObjectStore for Ext4Store {
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_>>()?;
+        drop(file);
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
@@ -266,14 +295,15 @@ impl PagedObjectStore for Ext4Store {
                 (end_req.start_page as u64 + end_req.nr_pages as u64) * PAGE_SIZE as u64
             });
 
-        let mut file = self.get_object_as_file(id, false)?;
+        let mut fs = self.fs.lock().unwrap();
+        let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if end_offset.unwrap_or(0) >= file.len() {
             self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
         }
-        let file = self.get_object_as_file(id, false)?;
-        let mut fs = self.fs.lock().unwrap();
-        let mut inode = fs.get_file_inode(&file)?;
-        let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
+        drop(file);
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
+        let mut inode = file.get_file_inode()?;
         tracing::debug!("paging out request for {} reqs", reqs.len());
 
         let mut blocks = reqs
@@ -302,6 +332,7 @@ impl PagedObjectStore for Ext4Store {
             })
             .try_collect::<Vec<_>>()?;
 
+        drop(file);
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
