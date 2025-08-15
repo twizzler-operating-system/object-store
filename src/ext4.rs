@@ -199,8 +199,11 @@ impl PagedObjectStore for Ext4Store {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if offset > file.len() {
-            file.ensure_backing(offset)?;
-            file.truncate(offset)?;
+            file.ensure_backing(offset)
+                .inspect_err(|e| tracing::warn!("failed to ensure backing for object: {}", e))?;
+            file.truncate(offset).inspect_err(|e| {
+                tracing::warn!("failed to initialize object to {}: {}", offset, e)
+            })?;
         }
         file.seek(SeekFrom::Start(offset))?;
         // TODO
@@ -299,9 +302,13 @@ impl PagedObjectStore for Ext4Store {
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if end_offset.unwrap_or(0) >= file.len() {
+            drop(file);
+            drop(fs);
             self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
+            fs = self.fs.lock().unwrap();
+        } else {
+            drop(file);
         }
-        drop(file);
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         let mut inode = file.get_file_inode()?;
         tracing::debug!("paging out request for {} reqs", reqs.len());
