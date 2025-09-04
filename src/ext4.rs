@@ -1,6 +1,7 @@
 #[cfg(not(target_os = "twizzler"))]
 use std::io::Result;
 use std::{
+    collections::HashMap,
     ffi::CString,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     sync::{
@@ -19,8 +20,50 @@ use crate::{
     PagedObjectStore, PosIo, PAGE_SIZE,
 };
 
+#[derive(Default)]
+struct ExtCache {
+    ids: HashMap<ObjID, (ExternalFile, usize)>,
+    names: HashMap<u32, HashMap<String, (ExternalFile, usize)>>,
+}
+
+#[allow(dead_code)]
+impl ExtCache {
+    pub fn fill_dir(&mut self, ino: u32, items: impl Iterator<Item = (ExternalFile, usize)>) {
+        let entry = self.names.entry(ino).or_default();
+        for item in items {
+            if let Some(name) = item.0.name() {
+                entry.insert(name.to_owned(), item.clone());
+                self.ids.insert(item.0.id.into(), item);
+            }
+        }
+    }
+
+    pub fn readdir(&self, ino: u32) -> Option<Vec<ExternalFile>> {
+        let entry = self.names.get(&ino)?;
+        Some(entry.values().map(|e| e.0).collect())
+    }
+
+    pub fn reset_dir(&mut self, ino: u32) {
+        if let Some(mut map) = self.names.remove(&ino) {
+            for item in map.drain() {
+                self.ids.remove(&item.1 .0.id.into());
+            }
+        }
+    }
+
+    pub fn lookup(&self, ino: u32, name: &str) -> Option<(ExternalFile, usize)> {
+        let map = self.names.get(&ino)?;
+        map.get(name).copied()
+    }
+
+    pub fn get_by_id(&self, id: ObjID) -> Option<(ExternalFile, usize)> {
+        self.ids.get(&id).copied()
+    }
+}
+
 pub struct Ext4Store {
     fs: Mutex<Ext4Fs>,
+    ext_cache: Mutex<ExtCache>,
     device: Arc<dyn Device>,
 }
 
@@ -139,6 +182,7 @@ impl Ext4Store {
         Ok(Self {
             fs: Mutex::new(fs),
             device,
+            ext_cache: Mutex::new(ExtCache::default()),
         })
     }
 
@@ -354,15 +398,29 @@ impl PagedObjectStore for Ext4Store {
         if inonr == 0 {
             inonr = ROOT_DIRECTORY_INODE;
         }
+
+        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
+            return Ok(r);
+        }
+
         let mut inode = fs.get_inode(inonr)?;
         let diriter = fs.dirents(&mut inode)?;
 
-        Ok(diriter
-            .filter_map(|de| {
-                de.1.ok()
-                    .map(|ino| ExternalFile::new(&de.0, ino.kind().into(), ino_to_objid(ino.num())))
+        let diriter = diriter.filter_map(|de| {
+            de.1.ok().map(|ino| {
+                (
+                    ExternalFile::new(&de.0, ino.kind().into(), ino_to_objid(ino.num())),
+                    ino.size() as usize,
+                )
             })
-            .collect())
+        });
+        self.ext_cache.lock().unwrap().reset_dir(inonr);
+        self.ext_cache.lock().unwrap().fill_dir(inonr, diriter);
+        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
+            Ok(r)
+        } else {
+            Err(ErrorKind::Other.into())
+        }
     }
 
     fn find_external(&self, id: ObjID) -> Result<usize> {
@@ -370,6 +428,9 @@ impl PagedObjectStore for Ext4Store {
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
             inonr = ROOT_DIRECTORY_INODE;
+        }
+        if let Some(info) = self.ext_cache.lock().unwrap().get_by_id(id) {
+            return Ok(info.1);
         }
         let inode = fs.get_inode(inonr)?;
         Ok(inode.size() as usize)
