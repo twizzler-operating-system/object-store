@@ -1,3 +1,4 @@
+#![allow(async_fn_in_trait)]
 pub type ObjID = u128;
 
 use core::str;
@@ -242,14 +243,18 @@ mod tests {
 
 pub trait PagedDevice {
     /// Append the needed paged phys mem for this device page, return the number of appended pages.
-    fn phys_addrs(&self, _start: DevicePage, _phys_list: &mut Vec<PagedPhysMem>) -> Result<usize> {
+    async fn phys_addrs(
+        &self,
+        _start: DevicePage,
+        _phys_list: &mut Vec<PagedPhysMem>,
+    ) -> Result<usize> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    fn sequential_read(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
-    fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
+    async fn sequential_read(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
+    async fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
 
-    fn len(&self) -> Result<usize>;
+    async fn len(&self) -> Result<usize>;
 }
 
 #[derive(Debug)]
@@ -283,13 +288,17 @@ impl PageRequest {
         self.phys_list
     }
 
-    fn setup_phys(&mut self, disk_pages: &[DevicePage], device: &dyn PagedDevice) -> Result<()> {
+    async fn setup_phys<PD: PagedDevice>(
+        &mut self,
+        disk_pages: &[DevicePage],
+        device: &PD,
+    ) -> Result<()> {
         // TODO: recover these
         self.phys_list.clear();
         for page in disk_pages {
             let mut count = 0;
             while count < page.nr_pages() {
-                match device.phys_addrs(*page, &mut self.phys_list) {
+                match device.phys_addrs(*page, &mut self.phys_list).await {
                     Ok(r) => {
                         if r == 0 {
                             break;
@@ -324,12 +333,12 @@ impl PageRequest {
         Ok(())
     }
 
-    pub fn page_in(
+    pub async fn page_in<PD: PagedDevice>(
         &mut self,
         disk_pages: &[DevicePage],
-        device: &dyn PagedDevice,
+        device: &PD,
     ) -> Result<usize> {
-        self.setup_phys(disk_pages, device)?;
+        self.setup_phys(disk_pages, device).await?;
         if self.phys_list.iter().all(|p| p.is_completed()) {
             return Ok(self.nr_pages as usize);
         }
@@ -369,7 +378,9 @@ impl PageRequest {
             if let DevicePage::Run(start, _len) = disk_page {
                 let mut count = 0;
                 while count < tmp.len() {
-                    let r = device.sequential_read(*start + count as u64, &tmp[count..])?;
+                    let r = device
+                        .sequential_read(*start + count as u64, &tmp[count..])
+                        .await?;
                     count += r;
                 }
             }
@@ -384,10 +395,10 @@ impl PageRequest {
         Ok(tfer_count)
     }
 
-    pub fn page_out(
+    pub async fn page_out<PD: PagedDevice>(
         &mut self,
         disk_pages: &[DevicePage],
-        device: &dyn PagedDevice,
+        device: &PD,
     ) -> Result<usize> {
         let mut cursor = 0;
         let mut inner_cursor = 0;
@@ -424,7 +435,9 @@ impl PageRequest {
             if let DevicePage::Run(start, _len) = disk_page {
                 let mut count = 0;
                 while count < tmp.len() {
-                    let r = device.sequential_write(*start + count as u64, &tmp[count..])?;
+                    let r = device
+                        .sequential_write(*start + count as u64, &tmp[count..])
+                        .await?;
                     count += r;
                 }
             }
@@ -441,9 +454,9 @@ impl PageRequest {
 }
 
 pub trait PagedObjectStore {
-    fn get_config_id(&self) -> Result<ObjID> {
+    async fn get_config_id(&self) -> Result<ObjID> {
         let mut buf = [0; 16];
-        self.read_object(0, 0, &mut buf).and_then(|len| {
+        self.read_object(0, 0, &mut buf).await.and_then(|len| {
             if len == 16 && buf.iter().find(|x| **x != 0).is_some() {
                 Ok(ObjID::from_le_bytes(buf))
             } else {
@@ -452,32 +465,32 @@ pub trait PagedObjectStore {
         })
     }
 
-    fn set_config_id(&self, id: ObjID) -> Result<()> {
-        let _ = self.delete_object(0);
-        self.create_object(0)?;
-        self.write_object(0, 0, &id.to_le_bytes())
+    async fn set_config_id(&self, id: ObjID) -> Result<()> {
+        let _ = self.delete_object(0).await;
+        self.create_object(0).await?;
+        self.write_object(0, 0, &id.to_le_bytes()).await
     }
 
-    fn create_object(&self, id: ObjID) -> Result<()>;
-    fn delete_object(&self, id: ObjID) -> Result<()>;
+    async fn create_object(&self, id: ObjID) -> Result<()>;
+    async fn delete_object(&self, id: ObjID) -> Result<()>;
 
-    fn len(&self, id: ObjID) -> Result<u64>;
+    async fn len(&self, id: ObjID) -> Result<u64>;
 
-    fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
+    async fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    async fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 
-    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    async fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    async fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
 
-    fn flush(&self) -> Result<()> {
+    async fn flush(&self) -> Result<()> {
         Ok(())
     }
 
-    fn enumerate_external(&self, _id: ObjID) -> Result<Vec<ExternalFile>> {
+    async fn enumerate_external(&self, _id: ObjID) -> Result<Vec<ExternalFile>> {
         Err(ErrorKind::Unsupported.into())
     }
 
-    fn find_external(&self, _id: ObjID) -> Result<usize> {
+    async fn find_external(&self, _id: ObjID) -> Result<usize> {
         Err(ErrorKind::Unsupported.into())
     }
 }
@@ -561,6 +574,6 @@ where
 }
 
 pub trait PosIo {
-    fn read(&self, start: u64, buf: &mut [u8]) -> Result<usize>;
-    fn write(&self, start: u64, buf: &[u8]) -> Result<usize>;
+    async fn read(&self, start: u64, buf: &mut [u8]) -> Result<usize>;
+    async fn write(&self, start: u64, buf: &[u8]) -> Result<usize>;
 }

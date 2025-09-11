@@ -14,8 +14,6 @@ fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", b
     "alloc",
 ], default-features = false }
 rand = "0.8"
-async-trait = "0.1.66"
-volatile = "0.6"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
 efs = { git = "https://github.com/dbittman/efs", features = [
@@ -24,6 +22,7 @@ efs = { git = "https://github.com/dbittman/efs", features = [
 ], branch = "twizzler-2025-04" }
 lru = "*"
 lwext4-rs = { path = "../../../ports/lwext4-rs" }
+futures = "*"
 
 [target.'cfg(target_os = "twizzler")'.dependencies]
 twizzler-abi = { path = "../../../lib/twizzler-abi" }

@@ -6,11 +6,12 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex, MutexGuard,
+        Mutex, MutexGuard,
     },
 };
 
 use efs::fs::ext2::inode::ROOT_DIRECTORY_INODE;
+use futures::executor::block_on;
 use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, O_CREAT, O_RDWR};
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
@@ -61,24 +62,22 @@ impl ExtCache {
     }
 }
 
-pub struct Ext4Store {
+pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
     ext_cache: Mutex<ExtCache>,
-    device: Arc<dyn Device>,
+    device: D,
 }
 
-pub trait Device: PosIo + PagedDevice + Sync + Send {}
+pub trait Device: PosIo + PagedDevice + Sync + Send + Clone + 'static {}
 
-impl<T: PosIo + PagedDevice + Sync + Send> Device for T {}
+impl<T: PosIo + PagedDevice + Sync + Send + Clone + 'static> Device for T {}
 
-struct Ext4Bd {
-    device: Arc<dyn Device>,
+struct Ext4Bd<D: Device> {
+    device: D,
     phys_bcount: u64,
-    lock: Mutex<bool>,
-    cv: Condvar,
 }
 
-impl Ext4BlockdevIface for Ext4Bd {
+impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
     fn phys_block_size(&mut self) -> u32 {
         PHYSICAL_BSIZE
     }
@@ -99,7 +98,8 @@ impl Ext4BlockdevIface for Ext4Bd {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
-        let len = self.device.read(start, slice)?;
+        // TODO: spawn this on an executor
+        let len = block_on(self.device.read(start, slice))?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
@@ -107,35 +107,25 @@ impl Ext4BlockdevIface for Ext4Bd {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-        let len = self.device.write(start, slice)?;
+        // TODO: spawn this on an executor
+        let len = block_on(self.device.write(start, slice))?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
     fn lock(&self) -> std::io::Result<()> {
-        let mut inner = self.lock.lock().unwrap();
-        while *inner {
-            inner = self.cv.wait(inner).unwrap();
-        }
-        *inner = true;
         Ok(())
     }
 
     fn unlock(&self) -> std::io::Result<()> {
-        let mut inner = self.lock.lock().unwrap();
-        assert!(*inner);
-        *inner = false;
-        self.cv.notify_all();
         Ok(())
     }
 }
 
-impl Ext4Bd {
-    fn new(device: Arc<dyn Device>, _name: &str, phys_bcount: u64) -> Self {
+impl<D: Device> Ext4Bd<D> {
+    fn new(device: D, _name: &str, phys_bcount: u64) -> Self {
         Self {
             device,
             phys_bcount,
-            lock: Mutex::new(false),
-            cv: Condvar::new(),
         }
     }
 }
@@ -156,13 +146,12 @@ static BDEV_ID: AtomicU64 = AtomicU64::new(0);
 const LOGICAL_BSIZE: u32 = 512;
 const PHYSICAL_BSIZE: u32 = 512;
 
-impl Ext4Store {
-    pub fn new<D: Device + 'static>(device: D, name: &str) -> Result<Self> {
+impl<D: Device> Ext4Store<D> {
+    pub async fn new(device: D, name: &str) -> Result<Self> {
         let bdname = format!("blockdev-{}", BDEV_ID.fetch_add(1, Ordering::SeqCst));
-        let max = device.len()? as u64;
+        let max = device.len().await? as u64;
         let bcount = max / LOGICAL_BSIZE as u64;
         let phys_bcount = max / PHYSICAL_BSIZE as u64;
-        let device = Arc::new(device);
         let bd = Ext4Blockdev::new(
             Ext4Bd::new(device.clone(), bdname.as_str(), phys_bcount),
             LOGICAL_BSIZE,
@@ -214,32 +203,32 @@ impl Ext4Store {
     }
 }
 
-impl PagedObjectStore for Ext4Store {
-    fn create_object(&self, id: crate::ObjID) -> Result<()> {
+impl<D: Device> PagedObjectStore for Ext4Store<D> {
+    async fn create_object(&self, id: crate::ObjID) -> Result<()> {
         let mut fs = self.fs.lock().unwrap();
         self.get_object_as_file(&mut fs, id, true)?;
         Ok(())
     }
 
-    fn delete_object(&self, id: crate::ObjID) -> Result<()> {
+    async fn delete_object(&self, id: crate::ObjID) -> Result<()> {
         let path = self.get_id_path(id);
         Ok(self.fs.lock().unwrap().remove_file(&path.1)?)
     }
 
-    fn len(&self, id: crate::ObjID) -> Result<u64> {
+    async fn len(&self, id: crate::ObjID) -> Result<u64> {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         Ok(file.len())
     }
 
-    fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    async fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.seek(SeekFrom::Start(offset))?;
         Ok(file.read(buf)?)
     }
 
-    fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
+    async fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if offset > file.len() {
@@ -255,28 +244,11 @@ impl PagedObjectStore for Ext4Store {
         Ok(())
     }
 
-    fn get_config_id(&self) -> Result<ObjID> {
-        let mut buf = [0; 16];
-        self.read_object(0, 0, &mut buf).and_then(|len| {
-            if len == 16 && buf.iter().find(|x| **x != 0).is_some() {
-                Ok(ObjID::from_le_bytes(buf))
-            } else {
-                Err(ErrorKind::InvalidData.into())
-            }
-        })
-    }
-
-    fn set_config_id(&self, id: ObjID) -> Result<()> {
-        let _ = self.delete_object(0);
-        self.create_object(0)?;
-        self.write_object(0, 0, &id.to_le_bytes())
-    }
-
-    fn flush(&self) -> Result<()> {
-        Ok(())
-    }
-
-    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
+    async fn page_in_object<'a>(
+        &self,
+        id: ObjID,
+        reqs: &'a mut [crate::PageRequest],
+    ) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
@@ -328,13 +300,17 @@ impl PagedObjectStore for Ext4Store {
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
-            let _len = br.0.page_in(pages, &*self.device)?;
+            let _len = br.0.page_in(pages, &self.device).await?;
         }
 
         Ok(reqs.len())
     }
 
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
+    async fn page_out_object<'a>(
+        &self,
+        id: ObjID,
+        reqs: &'a mut [crate::PageRequest],
+    ) -> Result<usize> {
         let end_offset = reqs
             .iter()
             .max_by_key(|req| req.start_page as u64 + req.nr_pages as u64)
@@ -348,7 +324,8 @@ impl PagedObjectStore for Ext4Store {
         if end_offset.unwrap_or(0) >= file.len() {
             drop(file);
             drop(fs);
-            self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])?;
+            self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])
+                .await?;
             fs = self.fs.lock().unwrap();
         } else {
             drop(file);
@@ -387,12 +364,12 @@ impl PagedObjectStore for Ext4Store {
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
-            let _len = br.0.page_out(pages, &*self.device)?;
+            let _len = br.0.page_out(pages, &self.device).await?;
         }
         Ok(reqs.len())
     }
 
-    fn enumerate_external(&self, id: ObjID) -> Result<Vec<ExternalFile>> {
+    async fn enumerate_external(&self, id: ObjID) -> Result<Vec<ExternalFile>> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
@@ -423,7 +400,7 @@ impl PagedObjectStore for Ext4Store {
         }
     }
 
-    fn find_external(&self, id: ObjID) -> Result<usize> {
+    async fn find_external(&self, id: ObjID) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
