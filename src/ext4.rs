@@ -13,12 +13,13 @@ use std::{
 use efs::fs::ext2::inode::ROOT_DIRECTORY_INODE;
 use futures::executor::block_on;
 use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, O_CREAT, O_RDWR};
+use mayheap::Vec;
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
 
 use crate::{
-    ino_to_objid, objid_to_ino, DevicePage, ExternalFile, ExternalKind, ObjID, PagedDevice,
-    PagedObjectStore, PosIo, PAGE_SIZE,
+    ino_to_objid, objid_to_ino, paged_object_store::MAYHEAP_LEN, DevicePage, ExternalFile,
+    ExternalKind, ObjID, PagedDevice, PagedObjectStore, PosIo, PAGE_SIZE,
 };
 
 #[derive(Default)]
@@ -39,7 +40,7 @@ impl ExtCache {
         }
     }
 
-    pub fn readdir(&self, ino: u32) -> Option<Vec<ExternalFile>> {
+    pub fn readdir(&self, ino: u32) -> Option<std::vec::Vec<ExternalFile>> {
         let entry = self.names.get(&ino)?;
         Some(entry.values().map(|e| e.0).collect())
     }
@@ -65,6 +66,7 @@ impl ExtCache {
 pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
     ext_cache: Mutex<ExtCache>,
+    len_cache: Mutex<HashMap<ObjID, u64>>,
     device: D,
 }
 
@@ -172,7 +174,20 @@ impl<D: Device> Ext4Store<D> {
             fs: Mutex::new(fs),
             device,
             ext_cache: Mutex::new(ExtCache::default()),
+            len_cache: Mutex::new(HashMap::default()),
         })
+    }
+
+    fn get_len_from_cache(&self, id: ObjID) -> Option<u64> {
+        self.len_cache.lock().unwrap().get(&id).copied()
+    }
+
+    fn invalidate_len(&self, id: ObjID) {
+        self.len_cache.lock().unwrap().remove(&id);
+    }
+
+    fn set_len_in_cache(&self, id: ObjID, len: u64) {
+        self.len_cache.lock().unwrap().insert(id, len);
     }
 
     pub fn get_id_path(&self, id: ObjID) -> (String, String) {
@@ -216,8 +231,12 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     }
 
     async fn len(&self, id: crate::ObjID) -> Result<u64> {
+        if let Some(len) = self.get_len_from_cache(id) {
+            return Ok(len);
+        }
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
+        self.set_len_in_cache(id, file.len());
         Ok(file.len())
     }
 
@@ -237,6 +256,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             file.truncate(offset).inspect_err(|e| {
                 tracing::warn!("failed to initialize object to {}: {}", offset, e)
             })?;
+            self.invalidate_len(id);
         }
         file.seek(SeekFrom::Start(offset))?;
         // TODO
@@ -257,7 +277,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut disk_pages = Vec::<DevicePage>::new();
+                let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
 
                 let mut page = req.start_page;
                 let end = req.start_page + req.nr_pages as i64;
@@ -287,15 +307,15 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                     page += item.nr_pages() as i64;
                     if let Some(prev) = disk_pages.last_mut() {
                         if !prev.try_extend(&item) {
-                            disk_pages.push(item);
+                            disk_pages.push(item).unwrap();
                         }
                     } else {
-                        disk_pages.push(item);
+                        disk_pages.push(item).unwrap();
                     }
                 }
                 Result::Ok((req, disk_pages))
             })
-            .try_collect::<Vec<_>>()?;
+            .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
         drop(file);
         drop(fs);
         for br in blocks.iter_mut() {
@@ -337,7 +357,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut disk_pages = Vec::<DevicePage>::new();
+                let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
                 for page in req.start_page..(req.start_page + req.nr_pages as i64) {
                     let mut block = page as u32;
                     if objid_to_ino(id).is_some() {
@@ -350,15 +370,15 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                     };
                     if let Some(prev) = disk_pages.last_mut() {
                         if !prev.try_extend(&item) {
-                            disk_pages.push(item);
+                            disk_pages.push(item).unwrap();
                         }
                     } else {
-                        disk_pages.push(item);
+                        disk_pages.push(item).unwrap();
                     }
                 }
                 Result::Ok((req, disk_pages))
             })
-            .try_collect::<Vec<_>>()?;
+            .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
 
         drop(file);
         drop(fs);
@@ -369,7 +389,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(reqs.len())
     }
 
-    async fn enumerate_external(&self, id: ObjID) -> Result<Vec<ExternalFile>> {
+    async fn enumerate_external(&self, id: ObjID) -> Result<std::vec::Vec<ExternalFile>> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {

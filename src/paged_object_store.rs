@@ -96,8 +96,8 @@ pub enum DevicePage {
 }
 
 impl DevicePage {
-    pub fn from_array(array: &[u64]) -> Vec<Self> {
-        let mut tmp = Vec::<Self>::new();
+    pub fn from_array(array: &[u64]) -> Vec<Self, MAYHEAP_LEN> {
+        let mut tmp = Vec::<Self, MAYHEAP_LEN>::new();
         for item in array {
             let item = if *item == 0 {
                 DevicePage::Hole(1)
@@ -106,10 +106,10 @@ impl DevicePage {
             };
             if let Some(prev) = tmp.last_mut() {
                 if !prev.try_extend(&item) {
-                    tmp.push(item);
+                    tmp.push(item).unwrap();
                 }
             } else {
-                tmp.push(item);
+                tmp.push(item).unwrap();
             }
         }
         tmp
@@ -246,7 +246,7 @@ pub trait PagedDevice {
     async fn phys_addrs(
         &self,
         _start: DevicePage,
-        _phys_list: &mut Vec<PagedPhysMem>,
+        _phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
     ) -> Result<usize> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
@@ -257,12 +257,15 @@ pub trait PagedDevice {
     async fn len(&self) -> Result<usize>;
 }
 
+use mayheap::Vec;
+
+pub const MAYHEAP_LEN: usize = 16;
 #[derive(Debug)]
 pub struct PageRequest {
     pub start_page: i64,
     pub nr_pages: u32,
     pub completed: u32,
-    pub phys_list: Vec<PagedPhysMem>,
+    pub phys_list: Vec<PagedPhysMem, MAYHEAP_LEN>,
 }
 
 impl PageRequest {
@@ -275,7 +278,11 @@ impl PageRequest {
         }
     }
 
-    pub fn new_from_list(phys_list: Vec<PagedPhysMem>, start_page: i64, nr_pages: u32) -> Self {
+    pub fn new_from_list(
+        phys_list: Vec<PagedPhysMem, MAYHEAP_LEN>,
+        start_page: i64,
+        nr_pages: u32,
+    ) -> Self {
         Self {
             start_page,
             phys_list,
@@ -284,7 +291,7 @@ impl PageRequest {
         }
     }
 
-    pub fn into_list(self) -> Vec<PagedPhysMem> {
+    pub fn into_list(self) -> Vec<PagedPhysMem, MAYHEAP_LEN> {
         self.phys_list
     }
 
@@ -346,7 +353,7 @@ impl PageRequest {
         let mut cursor = 0;
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
-        let mut tmp: Vec<PhysRange> = Vec::new();
+        let mut tmp: Vec<PhysRange, MAYHEAP_LEN> = Vec::new();
         for disk_page in disk_pages {
             let mut count = 0;
             tmp.clear();
@@ -361,7 +368,7 @@ impl PageRequest {
                         + (thislen * PAGE_SIZE) as u64,
                 };
 
-                tmp.push(new_range);
+                tmp.push(new_range).unwrap();
 
                 inner_cursor += thislen;
                 if inner_cursor >= self.phys_list[cursor].nr_pages() {
@@ -403,7 +410,7 @@ impl PageRequest {
         let mut cursor = 0;
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
-        let mut tmp: Vec<PhysRange> = Vec::new();
+        let mut tmp: Vec<PhysRange, MAYHEAP_LEN> = Vec::new();
         for disk_page in disk_pages {
             let mut count = 0;
             tmp.clear();
@@ -418,7 +425,7 @@ impl PageRequest {
                         + (thislen * PAGE_SIZE) as u64,
                 };
 
-                tmp.push(new_range);
+                tmp.push(new_range).unwrap();
 
                 inner_cursor += thislen;
                 if inner_cursor >= self.phys_list[cursor].nr_pages() {
@@ -486,7 +493,7 @@ pub trait PagedObjectStore {
         Ok(())
     }
 
-    async fn enumerate_external(&self, _id: ObjID) -> Result<Vec<ExternalFile>> {
+    async fn enumerate_external(&self, _id: ObjID) -> Result<std::vec::Vec<ExternalFile>> {
         Err(ErrorKind::Unsupported.into())
     }
 

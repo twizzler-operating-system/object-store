@@ -23,6 +23,7 @@ efs = { git = "https://github.com/dbittman/efs", features = [
 lru = "*"
 lwext4-rs = { path = "../../../ports/lwext4-rs" }
 futures = "*"
+mayheap = "*"
 
 [target.'cfg(target_os = "twizzler")'.dependencies]
 twizzler-abi = { path = "../../../lib/twizzler-abi" }
