@@ -274,7 +274,8 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         let mut inode = file.get_file_inode()?;
-        tracing::debug!("paging  in request for {} reqs", reqs.len());
+        let max_len = inode.size();
+        tracing::trace!("paging  in request for {} reqs", reqs.len());
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
@@ -283,35 +284,42 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 let mut page = req.start_page;
                 let end = req.start_page + req.nr_pages as i64;
 
-                while page < end {
-                    let mut block = page as u32;
-                    if objid_to_ino(id).is_some() {
-                        // External files don't have null pages
-                        block -= 1;
-                    }
-                    block = block * blocks_per_page as u32;
-                    let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
-
-                    let item = match inode.get_data_blocks(block, rem_blocks, false) {
-                        Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
-                            if dblock == 0 {
-                                DevicePage::Hole(nr_dblk)
-                            } else {
-                                DevicePage::Run(dblock, nr_dblk)
-                            }
+                let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
+                if rem_blocks > 64
+                    && page as usize * PAGE_SIZE >= (max_len as usize + PAGE_SIZE * 8)
+                {
+                    let _ = disk_pages.push(DevicePage::Hole(rem_blocks));
+                } else {
+                    while page < end {
+                        let mut block = page as u32;
+                        if objid_to_ino(id).is_some() {
+                            // External files don't have null pages
+                            block -= 1;
                         }
-                        _ => match inode.get_data_block(block, false)? {
-                            0 => DevicePage::Hole(1),
-                            dpg => DevicePage::Run(dpg, 1),
-                        },
-                    };
-                    page += item.nr_pages() as i64;
-                    if let Some(prev) = disk_pages.last_mut() {
-                        if !prev.try_extend(&item) {
+                        block = block * blocks_per_page as u32;
+                        let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
+
+                        let item = match inode.get_data_blocks(block, rem_blocks, false) {
+                            Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
+                                if dblock == 0 {
+                                    DevicePage::Hole(nr_dblk)
+                                } else {
+                                    DevicePage::Run(dblock, nr_dblk)
+                                }
+                            }
+                            _ => match inode.get_data_block(block, false)? {
+                                0 => DevicePage::Hole(1),
+                                dpg => DevicePage::Run(dpg, 1),
+                            },
+                        };
+                        page += item.nr_pages() as i64;
+                        if let Some(prev) = disk_pages.last_mut() {
+                            if !prev.try_extend(&item) {
+                                disk_pages.push(item).unwrap();
+                            }
+                        } else {
                             disk_pages.push(item).unwrap();
                         }
-                    } else {
-                        disk_pages.push(item).unwrap();
                     }
                 }
                 Result::Ok((req, disk_pages))
@@ -321,6 +329,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
+            tracing::trace!("paging in {:?}", pages);
             let _len = br.0.page_in(pages, &self.device).await?;
         }
 
@@ -354,23 +363,40 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         }
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         let mut inode = file.get_file_inode()?;
-        tracing::debug!("paging out request for {} reqs", reqs.len());
+        tracing::trace!("paging out request for {} reqs", reqs.len());
 
         let setup_done = Instant::now();
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
                 let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
-                for page in req.start_page..(req.start_page + req.nr_pages as i64) {
+
+                let mut page = req.start_page;
+                let end = req.start_page + req.nr_pages as i64;
+                while page < end {
                     let mut block = page as u32;
                     if objid_to_ino(id).is_some() {
                         // External files don't have null pages
                         block -= 1;
                     }
-                    let item = match inode.get_data_block(block * blocks_per_page as u32, true)? {
-                        0 => Result::Err(ErrorKind::Other.into())?,
-                        dpg => DevicePage::Run(dpg, 1),
+
+                    block = block * blocks_per_page as u32;
+                    let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
+
+                    let item = match inode.get_data_blocks(block, rem_blocks, true) {
+                        Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
+                            if dblock == 0 {
+                                Result::Err(ErrorKind::Other.into())?
+                            } else {
+                                DevicePage::Run(dblock, nr_dblk)
+                            }
+                        }
+                        _ => match inode.get_data_block(block, true)? {
+                            0 => Result::Err(ErrorKind::Other.into())?,
+                            dpg => DevicePage::Run(dpg, 1),
+                        },
                     };
+                    page += item.nr_pages() as i64;
                     if let Some(prev) = disk_pages.last_mut() {
                         if !prev.try_extend(&item) {
                             disk_pages.push(item).unwrap();
@@ -391,7 +417,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             let _len = br.0.page_out(pages, &self.device).await?;
         }
         let io_done = Instant::now();
-        tracing::debug!(
+        tracing::trace!(
             "==> {}ms {}ms {}ms",
             (setup_done - start).as_millis(),
             (blocks_found - setup_done).as_millis(),
