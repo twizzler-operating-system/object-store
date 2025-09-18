@@ -8,6 +8,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Mutex, MutexGuard,
     },
+    time::Instant,
 };
 
 use efs::fs::ext2::inode::ROOT_DIRECTORY_INODE;
@@ -338,6 +339,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 (end_req.start_page as u64 + end_req.nr_pages as u64) * PAGE_SIZE as u64
             });
 
+        let start = Instant::now();
         let mut fs = self.fs.lock().unwrap();
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
@@ -354,6 +356,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut inode = file.get_file_inode()?;
         tracing::debug!("paging out request for {} reqs", reqs.len());
 
+        let setup_done = Instant::now();
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
@@ -380,12 +383,20 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
 
+        let blocks_found = Instant::now();
         drop(file);
         drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
             let _len = br.0.page_out(pages, &self.device).await?;
         }
+        let io_done = Instant::now();
+        tracing::debug!(
+            "==> {}ms {}ms {}ms",
+            (setup_done - start).as_millis(),
+            (blocks_found - setup_done).as_millis(),
+            (io_done - blocks_found).as_millis()
+        );
         Ok(reqs.len())
     }
 
