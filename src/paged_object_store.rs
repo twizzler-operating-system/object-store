@@ -2,8 +2,9 @@
 pub type ObjID = u128;
 
 use core::str;
-use std::{io::ErrorKind, ops::Add};
+use std::{future::Future, io::ErrorKind, ops::Add, thread::yield_now};
 
+use async_io::block_on;
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
 #[cfg(target_os = "twizzler")]
@@ -255,6 +256,14 @@ pub trait PagedDevice {
     async fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
 
     async fn len(&self) -> Result<usize>;
+
+    fn yield_now(&self) {
+        yield_now();
+    }
+
+    fn run_async<R: 'static>(&self, f: impl Future<Output = R>) -> R {
+        block_on(f)
+    }
 }
 
 use mayheap::Vec;
@@ -314,12 +323,16 @@ impl PageRequest {
                     }
                     Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
                         if self.phys_list.is_empty() {
+                            tracing::error!(": {}", e);
                             return Err(e);
                         } else {
                             break;
                         }
                     }
-                    Err(e) => Err(e)?,
+                    Err(e) => {
+                        tracing::error!(": {}", e);
+                        Err(e)?
+                    }
                 }
             }
 
@@ -387,7 +400,8 @@ impl PageRequest {
                 while count < tmp.len() {
                     let r = device
                         .sequential_read(*start + count as u64, &tmp[count..])
-                        .await?;
+                        .await
+                        .inspect_err(|e| tracing::error!("read err: {}", e))?;
                     count += r;
                 }
             }
@@ -444,7 +458,8 @@ impl PageRequest {
                 while count < tmp.len() {
                     let r = device
                         .sequential_write(*start + count as u64, &tmp[count..])
-                        .await?;
+                        .await
+                        .inspect_err(|e| tracing::error!("write err: {}", e))?;
                     count += r;
                 }
             }

@@ -24,6 +24,8 @@ lru = "*"
 lwext4-rs = { path = "../../../ports/lwext4-rs" }
 futures = "*"
 mayheap = "*"
+async-io = "*"
+async-executor = "*"
 
 [target.'cfg(target_os = "twizzler")'.dependencies]
 twizzler-abi = { path = "../../../lib/twizzler-abi" }

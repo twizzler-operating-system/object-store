@@ -12,8 +12,9 @@ use std::{
 };
 
 use efs::fs::ext2::inode::ROOT_DIRECTORY_INODE;
-use futures::executor::block_on;
-use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, O_CREAT, O_RDWR};
+use lwext4_rs::{
+    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, MpLock, O_CREAT, O_RDWR,
+};
 use mayheap::Vec;
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
@@ -78,6 +79,7 @@ impl<T: PosIo + PagedDevice + Sync + Send + Clone + 'static> Device for T {}
 struct Ext4Bd<D: Device> {
     device: D,
     phys_bcount: u64,
+    lock: MpLock,
 }
 
 impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
@@ -101,8 +103,7 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
-        // TODO: spawn this on an executor
-        let len = block_on(self.device.read(start, slice))?;
+        let len = self.device.run_async(self.device.read(start, slice))?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
@@ -110,16 +111,17 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-        // TODO: spawn this on an executor
-        let len = block_on(self.device.write(start, slice))?;
+        let len = self.device.run_async(self.device.write(start, slice))?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
     fn lock(&self) -> std::io::Result<()> {
+        self.lock.lock();
         Ok(())
     }
 
     fn unlock(&self) -> std::io::Result<()> {
+        self.lock.unlock();
         Ok(())
     }
 }
@@ -129,6 +131,7 @@ impl<D: Device> Ext4Bd<D> {
         Self {
             device,
             phys_bcount,
+            lock: MpLock::new(),
         }
     }
 }
@@ -223,12 +226,16 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     async fn create_object(&self, id: crate::ObjID) -> Result<()> {
         let mut fs = self.fs.lock().unwrap();
         self.get_object_as_file(&mut fs, id, true)?;
+        fs.flush()?;
         Ok(())
     }
 
     async fn delete_object(&self, id: crate::ObjID) -> Result<()> {
         let path = self.get_id_path(id);
-        Ok(self.fs.lock().unwrap().remove_file(&path.1)?)
+        let mut fs = self.fs.lock().unwrap();
+        fs.remove_file(&path.1)?;
+        fs.flush()?;
+        Ok(())
     }
 
     async fn len(&self, id: crate::ObjID) -> Result<u64> {
@@ -262,6 +269,8 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         file.seek(SeekFrom::Start(offset))?;
         // TODO
         file.write(buf)?;
+        drop(file);
+        fs.flush()?;
         Ok(())
     }
 
@@ -272,10 +281,18 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     ) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
-        let mut file = self.get_object_as_file(&mut fs, id, false)?;
-        let mut inode = file.get_file_inode()?;
+        let mut file = self
+            .get_object_as_file(&mut fs, id, false)
+            .inspect_err(|e| tracing::error!("go err: {}", e))?;
+        let mut inode = file
+            .get_file_inode()
+            .inspect_err(|e| tracing::error!("gfi err: {}", e))?;
         let max_len = inode.size();
         tracing::trace!("paging  in request for {} reqs", reqs.len());
+
+        let mut iters = 0;
+        drop(file);
+        drop(fs);
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
@@ -290,7 +307,15 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 {
                     let _ = disk_pages.push(DevicePage::Hole(rem_blocks));
                 } else {
+                    let mut fs = self.fs.lock().unwrap();
                     while page < end {
+                        iters += 1;
+                        if iters % 100 == 0 {
+                            drop(fs);
+                            self.device.yield_now();
+                            fs = self.fs.lock().unwrap();
+                        }
+
                         let mut block = page as u32;
                         if objid_to_ino(id).is_some() {
                             // External files don't have null pages
@@ -325,8 +350,6 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
-        drop(file);
-        drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
             tracing::trace!("paging in {:?}", pages);
@@ -363,12 +386,16 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         }
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         let mut inode = file.get_file_inode()?;
+        drop(file);
+        drop(fs);
         tracing::trace!("paging out request for {} reqs", reqs.len());
 
         let setup_done = Instant::now();
+        let mut iters = 0;
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
+                let mut fs = self.fs.lock().unwrap();
                 let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
 
                 let mut page = req.start_page;
@@ -378,6 +405,13 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                     if objid_to_ino(id).is_some() {
                         // External files don't have null pages
                         block -= 1;
+                    }
+
+                    iters += 1;
+                    if iters % 100 == 0 {
+                        drop(fs);
+                        self.device.yield_now();
+                        fs = self.fs.lock().unwrap();
                     }
 
                     block = block * blocks_per_page as u32;
@@ -410,12 +444,12 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
 
         let blocks_found = Instant::now();
-        drop(file);
-        drop(fs);
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
             let _len = br.0.page_out(pages, &self.device).await?;
         }
+        let mut fs = self.fs.lock().unwrap();
+        fs.flush()?;
         let io_done = Instant::now();
         tracing::trace!(
             "==> {}ms {}ms {}ms",
