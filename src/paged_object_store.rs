@@ -372,7 +372,8 @@ impl PageRequest {
             tmp.clear();
             while count < disk_page.nr_pages() {
                 let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor)
+                    .min(1);
 
                 let new_range = PhysRange {
                     start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
@@ -396,6 +397,9 @@ impl PageRequest {
             }
 
             if let DevicePage::Run(start, _len) = disk_page {
+                //todo: this needs to take into account the number of PAGES actually read, not the
+                // number of ENTRIES in tmp, and tmp should be consoledated above, and the driver
+                // will need to be updated too.
                 let mut count = 0;
                 while count < tmp.len() {
                     let r = device
@@ -430,7 +434,8 @@ impl PageRequest {
             tmp.clear();
             while count < disk_page.nr_pages() {
                 let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor)
+                    .min(1);
 
                 let new_range = PhysRange {
                     start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
@@ -439,6 +444,7 @@ impl PageRequest {
                         + (thislen * PAGE_SIZE) as u64,
                 };
 
+                println!("thislen: {}", thislen);
                 tmp.push(new_range).unwrap();
 
                 inner_cursor += thislen;
