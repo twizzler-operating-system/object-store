@@ -326,7 +326,6 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
 
                         let item = match inode.get_data_blocks(block, rem_blocks, false) {
                             Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
-                                tracing::info!("{}: {}: {} {}", page, block, dblock, nr_dblk);
                                 if dblock == 0 {
                                     DevicePage::Hole(nr_dblk)
                                 } else {

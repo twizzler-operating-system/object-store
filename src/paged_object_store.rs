@@ -372,8 +372,7 @@ impl PageRequest {
             tmp.clear();
             while count < disk_page.nr_pages() {
                 let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor)
-                    .min(1);
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
 
                 let new_range = PhysRange {
                     start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
@@ -397,16 +396,27 @@ impl PageRequest {
             }
 
             if let DevicePage::Run(start, _len) = disk_page {
-                //todo: this needs to take into account the number of PAGES actually read, not the
-                // number of ENTRIES in tmp, and tmp should be consoledated above, and the driver
-                // will need to be updated too.
                 let mut count = 0;
-                while count < tmp.len() {
-                    let r = device
-                        .sequential_read(*start + count as u64, &tmp[count..])
+                let mut idx = 0;
+                while idx < tmp.len() {
+                    let mut r = device
+                        .sequential_read(*start + count as u64, &tmp[idx..])
                         .await
                         .inspect_err(|e| tracing::error!("read err: {}", e))?;
-                    count += r;
+
+                    while r > 0 {
+                        let thiscount: usize = tmp[idx].page_count().min(r);
+                        if tmp[idx].page_count() == thiscount {
+                            idx += 1;
+                        } else {
+                            tmp[idx] = PhysRange {
+                                start: tmp[idx].start + (thiscount * PAGE_SIZE) as u64,
+                                end: tmp[idx].end,
+                            };
+                        }
+                        r -= thiscount;
+                        count += thiscount;
+                    }
                 }
             }
 
@@ -434,8 +444,7 @@ impl PageRequest {
             tmp.clear();
             while count < disk_page.nr_pages() {
                 let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor)
-                    .min(1);
+                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
 
                 let new_range = PhysRange {
                     start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
@@ -444,7 +453,6 @@ impl PageRequest {
                         + (thislen * PAGE_SIZE) as u64,
                 };
 
-                println!("thislen: {}", thislen);
                 tmp.push(new_range).unwrap();
 
                 inner_cursor += thislen;
@@ -461,12 +469,26 @@ impl PageRequest {
 
             if let DevicePage::Run(start, _len) = disk_page {
                 let mut count = 0;
-                while count < tmp.len() {
-                    let r = device
-                        .sequential_write(*start + count as u64, &tmp[count..])
+                let mut idx = 0;
+                while idx < tmp.len() {
+                    let mut r = device
+                        .sequential_write(*start + count as u64, &tmp[idx..])
                         .await
                         .inspect_err(|e| tracing::error!("write err: {}", e))?;
-                    count += r;
+
+                    while r > 0 {
+                        let thiscount: usize = tmp[idx].page_count().min(r);
+                        if tmp[idx].page_count() == thiscount {
+                            idx += 1;
+                        } else {
+                            tmp[idx] = PhysRange {
+                                start: tmp[idx].start + (thiscount * PAGE_SIZE) as u64,
+                                end: tmp[idx].end,
+                            };
+                        }
+                        r -= thiscount;
+                        count += thiscount;
+                    }
                 }
             }
 
