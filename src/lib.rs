@@ -1,5 +1,4 @@
 #![feature(iterator_try_collect)]
-#![feature(slice_as_chunks)]
 //mod fs;
 //mod kms;
 //mod lethe_object_store;

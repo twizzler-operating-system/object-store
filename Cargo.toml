@@ -16,10 +16,6 @@ fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", b
 rand = "0.8"
 intervaltree = { version = "0.2.7", features = ["serde"] }
 tracing = "*"
-efs = { git = "https://github.com/dbittman/efs", features = [
-    "std",
-    "ext2",
-], branch = "twizzler-2025-04" }
 lru = "*"
 lwext4-rs = { path = "../../../ports/lwext4-rs" }
 futures = "*"

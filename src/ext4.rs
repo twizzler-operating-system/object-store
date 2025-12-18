@@ -11,7 +11,6 @@ use std::{
     time::Instant,
 };
 
-use efs::fs::ext2::inode::ROOT_DIRECTORY_INODE;
 use lwext4_rs::{
     Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, MpLock, O_CREAT, O_RDWR,
 };
@@ -464,7 +463,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
-            inonr = ROOT_DIRECTORY_INODE;
+            inonr = 2;
         }
 
         if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
@@ -495,7 +494,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
-            inonr = ROOT_DIRECTORY_INODE;
+            inonr = 2;
         }
         if let Some(info) = self.ext_cache.lock().unwrap().get_by_id(id) {
             return Ok(info.1);
