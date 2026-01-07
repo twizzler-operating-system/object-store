@@ -5,27 +5,27 @@ edition = "2021"
 
 
 [dependencies]
-obliviate-core = { version = "0.1.0", git = "https://github.com/twizzler-operating-system/obliviate.git", branch = "nonstatic_lifetime_support" }
-chacha20 = { version = "0.9.1", features = ["std", "zeroize"] }
-fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", branch = "zphrs-rwproxy", version = "0.4.0", features = [
-    "std",
-    "log_level_info",
-    "lfn",
-    "alloc",
-], default-features = false }
+#obliviate-core = { workspace = true }
+chacha20 = { workspace = true, features = ["std", "zeroize"] }
+#fatfs = { git = "https://github.com/twizzler-operating-system/rust-fatfs.git", branch = "zphrs-rwproxy", version = "0.4.0", features = [
+#    "std",
+#    "log_level_info",
+#    "lfn",
+#    "alloc",
+#], default-features = false }
 rand = "0.8"
-intervaltree = { version = "0.2.7", features = ["serde"] }
-tracing = "*"
-lru = "*"
-lwext4-rs = { path = "../../../ports/lwext4-rs" }
-futures = "*"
-mayheap = "*"
-async-io = "*"
-async-executor = "*"
+intervaltree = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+lru = { workspace = true }
+lwext4-rs = { workspace = true }
+futures = { workspace = true }
+mayheap = { workspace = true }
+async-io = { workspace = true }
+async-executor = { workspace = true }
 
 [target.'cfg(target_os = "twizzler")'.dependencies]
 twizzler-abi = { path = "../../../lib/twizzler-abi" }
 twizzler = { path = "../../../lib/twizzler" }
 
 [dev-dependencies]
-tracing-subscriber = "*"
+tracing-subscriber = { workspace = true }
