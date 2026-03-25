@@ -11,16 +11,15 @@ use std::{
     time::Instant,
 };
 
-use lwext4_rs::{
-    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, MpLock, O_CREAT, O_RDWR,
-};
+use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDWR};
 use mayheap::Vec;
+use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
 
 use crate::{
-    ino_to_objid, objid_to_ino, paged_object_store::MAYHEAP_LEN, DevicePage, ExternalFile,
-    ExternalKind, ObjID, PagedDevice, PagedObjectStore, PosIo, PAGE_SIZE,
+    paged_object_store::MAYHEAP_LEN, DevicePage, ObjID, PagedDevice, PagedObjectStore, PosIo,
+    PAGE_SIZE,
 };
 
 #[derive(Default)]
@@ -131,17 +130,6 @@ impl<D: Device> Ext4Bd<D> {
             device,
             phys_bcount,
             lock: MpLock::new(),
-        }
-    }
-}
-
-impl From<FileKind> for ExternalKind {
-    fn from(value: FileKind) -> Self {
-        match value {
-            FileKind::Regular => ExternalKind::Regular,
-            FileKind::Directory => ExternalKind::Directory,
-            FileKind::Symlink => ExternalKind::SymLink,
-            FileKind::Other => ExternalKind::Other,
         }
     }
 }
@@ -316,7 +304,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                         }
 
                         let mut block = page as u32;
-                        if objid_to_ino(id).is_some() {
+                        if objid_to_ino(id).is_some() && block > 0 {
                             // External files don't have null pages
                             block -= 1;
                         }
