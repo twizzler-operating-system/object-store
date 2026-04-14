@@ -1,23 +1,15 @@
 #![allow(async_fn_in_trait)]
 pub type ObjID = u128;
 
-use std::{future::Future, io::ErrorKind, ops::Add, thread::yield_now};
+use std::{future::Future, io::ErrorKind, ops::Add, path::Path, thread::yield_now};
 
 use async_io::block_on;
-pub use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
-#[cfg(target_os = "twizzler")]
+use libc::mode_t;
+pub use pager_dynamic::{
+    ino_to_objid, objid_to_ino, ExternalFile, ExternalFileSbHdr, ExternalKind,
+};
 use twizzler::Result;
-#[cfg(target_os = "twizzler")]
 pub use twizzler_abi::pager::PhysRange;
-
-#[cfg(not(target_os = "twizzler"))]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub struct PhysRange {
-    pub start: u64,
-    pub end: u64,
-}
-#[cfg(not(target_os = "twizzler"))]
-use std::io::Result;
 
 use crate::PAGE_SIZE;
 
@@ -535,14 +527,50 @@ pub trait PagedObjectStore {
     async fn flush(&self) -> Result<()> {
         Ok(())
     }
+}
 
-    async fn enumerate_external(&self, _id: ObjID) -> Result<std::vec::Vec<ExternalFile>> {
-        Err(ErrorKind::Unsupported.into())
+bitflags::bitflags! {
+    pub struct ExternalOpenFlags: u32 {
+        const READ = 0b0001;
+        const WRITE = 0b0010;
+        const CREATE = 0b0100;
+        const TRUNCATE = 0b1000;
     }
+}
 
-    async fn find_external(&self, _id: ObjID) -> Result<usize> {
-        Err(ErrorKind::Unsupported.into())
-    }
+pub trait ExternalFileStore {
+    async fn open_external(
+        &self,
+        at: Option<ObjID>,
+        path: impl AsRef<Path>,
+        flags: ExternalOpenFlags,
+        mode: mode_t,
+    ) -> Result<ExternalFile>;
+
+    async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;
+
+    async fn readdir_external(
+        &self,
+        dir: ObjID,
+        entries: &mut std::vec::Vec<ExternalFile>,
+    ) -> Result<()>;
+
+    async fn link_external(
+        &self,
+        file: &ExternalFile,
+        at: Option<ObjID>,
+        path: impl AsRef<Path>,
+    ) -> Result<()>;
+
+    async fn stat_external(&self, path: impl AsRef<Path>) -> Result<libc::stat>;
+    async fn fstat_external(&self, file: Option<ObjID>) -> Result<libc::stat>;
+
+    async fn symlink_external(
+        &self,
+        at: Option<ObjID>,
+        target: impl AsRef<Path>,
+        linkpath: impl AsRef<Path>,
+    ) -> Result<()>;
 }
 
 pub(crate) fn _consecutive_slices<T: PartialEq + Add<u64> + Copy>(

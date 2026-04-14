@@ -4,6 +4,7 @@ use std::{
     collections::HashMap,
     ffi::CString,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, MutexGuard,
@@ -11,6 +12,7 @@ use std::{
     time::Instant,
 };
 
+use libc::mode_t;
 use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDWR};
 use mayheap::Vec;
 use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
@@ -18,8 +20,8 @@ use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 use twizzler::Result;
 
 use crate::{
-    paged_object_store::MAYHEAP_LEN, DevicePage, ObjID, PagedDevice, PagedObjectStore, PosIo,
-    PAGE_SIZE,
+    paged_object_store::MAYHEAP_LEN, DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID,
+    PagedDevice, PagedObjectStore, PosIo, PAGE_SIZE,
 };
 
 #[derive(Default)]
@@ -40,10 +42,12 @@ impl ExtCache {
         }
     }
 
+    /*
     pub fn readdir(&self, ino: u32) -> Option<std::vec::Vec<ExternalFile>> {
         let entry = self.names.get(&ino)?;
         Some(entry.values().map(|e| e.0).collect())
     }
+    */
 
     pub fn reset_dir(&mut self, ino: u32) {
         if let Some(mut map) = self.names.remove(&ino) {
@@ -53,6 +57,7 @@ impl ExtCache {
         }
     }
 
+    /*
     pub fn lookup(&self, ino: u32, name: &str) -> Option<(ExternalFile, usize)> {
         let map = self.names.get(&ino)?;
         map.get(name).copied()
@@ -61,6 +66,7 @@ impl ExtCache {
     pub fn get_by_id(&self, id: ObjID) -> Option<(ExternalFile, usize)> {
         self.ids.get(&id).copied()
     }
+    */
 }
 
 pub struct Ext4Store<D: Device> {
@@ -447,6 +453,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(reqs.len())
     }
 
+    /*
     async fn enumerate_external(&self, id: ObjID) -> Result<std::vec::Vec<ExternalFile>> {
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
@@ -489,5 +496,105 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         }
         let inode = fs.get_inode(inonr)?;
         Ok(inode.size() as usize)
+    }
+    */
+}
+
+impl<D: Device> Ext4Store<D> {
+    pub async fn do_open_at(
+        at: Option<&ExternalFile>,
+        path: impl AsRef<Path>,
+        flags: ExternalOpenFlags,
+        mode: mode_t,
+    ) -> Result<ExternalFile> {
+        // Implementation for openat
+        unimplemented!()
+    }
+}
+
+impl<D: Device> ExternalFileStore for Ext4Store<D> {
+    async fn open_external(
+        &self,
+        at: Option<ObjID>,
+        path: impl AsRef<Path>,
+        flags: ExternalOpenFlags,
+        mode: mode_t,
+    ) -> Result<ExternalFile> {
+        todo!()
+    }
+
+    async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
+        todo!()
+    }
+
+    async fn readdir_external(
+        &self,
+        dir: ObjID,
+        entries: &mut std::vec::Vec<ExternalFile>,
+    ) -> Result<()> {
+        let mut fs = self.fs.lock().unwrap();
+        let mut inonr = objid_to_ino(dir).ok_or(ErrorKind::InvalidInput)?;
+        if inonr == 0 {
+            inonr = 2;
+        }
+
+        //if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
+        //    return Ok(r);
+        //}
+
+        let mut inode = fs.get_inode(inonr)?;
+        let diriter = fs.dirents(&mut inode)?;
+
+        let diriter = diriter.filter_map(|de| {
+            de.1.ok().map(|ino| {
+                ExternalFile::new(
+                    unsafe { str::from_utf8_unchecked(&de.0) },
+                    ino.kind().into(),
+                    ino_to_objid(ino.num()),
+                )
+            })
+        });
+
+        for entry in diriter {
+            entries.push(entry)
+        }
+
+        Ok(())
+
+        //self.ext_cache.lock().unwrap().reset_dir(inonr);
+        //self.ext_cache.lock().unwrap().fill_dir(inonr, diriter);
+        /*
+        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
+            Ok(r)
+        } else {
+            Err(ErrorKind::Other.into())
+        }
+        */
+    }
+
+    async fn link_external(
+        &self,
+        file: &ExternalFile,
+        at: Option<ObjID>,
+        path: impl AsRef<Path>,
+    ) -> Result<()> {
+        todo!()
+    }
+
+    async fn stat_external(&self, path: impl AsRef<Path>) -> Result<libc::stat> {
+        todo!()
+    }
+
+    async fn fstat_external(&self, file: Option<ObjID>) -> Result<libc::stat> {
+        todo!()
+    }
+
+    async fn symlink_external(
+        &self,
+        at: Option<ObjID>,
+        target: impl AsRef<Path>,
+        linkpath: impl AsRef<Path>,
+    ) -> Result<()> {
+        todo!()
     }
 }

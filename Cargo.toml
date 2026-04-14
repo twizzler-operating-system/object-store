@@ -22,6 +22,8 @@ futures = { workspace = true }
 mayheap = { workspace = true }
 async-io = { workspace = true }
 async-executor = { workspace = true }
+bitflags = "*"
+libc = { workspace = true }
 
 [target.'cfg(target_os = "twizzler")'.dependencies]
 twizzler-abi = { path = "../../../lib/twizzler-abi" }
