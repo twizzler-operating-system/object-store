@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ffi::CString,
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Mutex, MutexGuard,
@@ -13,7 +13,9 @@ use std::{
 };
 
 use libc::mode_t;
-use lwext4_rs::{Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDWR};
+use lwext4_rs::{
+    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR,
+};
 use mayheap::Vec;
 use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 #[cfg(target_os = "twizzler")]
@@ -191,6 +193,14 @@ impl<D: Device> Ext4Store<D> {
         let top = id.to_be_bytes()[0];
         let us = format!("ids/{:x}", top);
         (us, format!("ids/{:x}/{:x}", top, id))
+    }
+
+    pub fn set_len(&self, id: ObjID, len: u64) -> Result<()> {
+        let mut fs = self.fs.lock().unwrap();
+        let mut file = self.get_object_as_file(&mut fs, id, false)?;
+        file.truncate(len)?;
+        self.set_len_in_cache(id, len);
+        Ok(())
     }
 
     pub fn get_object_as_file<'a>(
@@ -381,7 +391,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut inode = file.get_file_inode()?;
         drop(file);
         drop(fs);
-        tracing::trace!("paging out request for {} reqs", reqs.len());
+        tracing::trace!("paging out {:x} request for {} reqs", id, reqs.len());
 
         let setup_done = Instant::now();
         let mut iters = 0;
@@ -395,7 +405,8 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 let end = req.start_page + req.nr_pages as i64;
                 while page < end {
                     let mut block = page as u32;
-                    if objid_to_ino(id).is_some() {
+                    tracing::trace!("paging out block {}",  block);
+                    if objid_to_ino(id).is_some() && block > 0 {
                         // External files don't have null pages
                         block -= 1;
                     }
@@ -413,13 +424,23 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                     let item = match inode.get_data_blocks(block, rem_blocks, true) {
                         Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
                             if dblock == 0 {
+                                tracing::warn!(
+                                    "got unexpected zero block when paging out object {:x}",
+                                    id
+                                );
                                 Result::Err(ErrorKind::Other.into())?
                             } else {
                                 DevicePage::Run(dblock, nr_dblk)
                             }
                         }
-                        _ => match inode.get_data_block(block, true)? {
-                            0 => Result::Err(ErrorKind::Other.into())?,
+                        _ => match inode.get_data_block(block, true).inspect_err(|e| tracing::warn!("failed to get_data_block: {}", e))? {
+                            0 => {
+                                tracing::warn!(
+                                    "got unexpected zero block when paging out object {:x} in fallback",
+                                    id
+                                );
+                                Result::Err(ErrorKind::Other.into())?
+                            }
                             dpg => DevicePage::Run(dpg, 1),
                         },
                     };
@@ -435,6 +456,10 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
+        tracing::trace!(
+            "found blocks for paging out in {}ms",
+            (Instant::now() - setup_done).as_millis()
+        );
 
         let blocks_found = Instant::now();
         for br in blocks.iter_mut() {
@@ -520,7 +545,40 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         flags: ExternalOpenFlags,
         mode: mode_t,
     ) -> Result<ExternalFile> {
-        todo!()
+        let at_ino = if let Some(at) = at {
+            objid_to_ino(at).ok_or(ErrorKind::InvalidInput)?
+        } else {
+            2
+        };
+
+        let mut fs = self.fs.lock().unwrap();
+
+        let mut oflags = if flags.contains(ExternalOpenFlags::READ)
+            && flags.contains(ExternalOpenFlags::WRITE)
+        {
+            O_RDWR
+        } else if flags.contains(ExternalOpenFlags::READ) {
+            O_RDONLY
+        } else {
+            O_RDWR
+        };
+
+        if flags.contains(ExternalOpenFlags::CREATE) {
+            oflags |= O_CREAT;
+        }
+
+        let mut file = fs.open_file_from_container(
+            at_ino,
+            path.as_ref().to_string_lossy().as_ref(),
+            oflags,
+            mode,
+        )?;
+
+        Ok(ExternalFile::new(
+            path.as_ref().to_string_lossy().to_string(),
+            file.get_file_inode()?.kind().into(),
+            ino_to_objid(file.get_file_inode()?.num()),
+        ))
     }
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
