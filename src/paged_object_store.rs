@@ -548,6 +548,7 @@ pub trait ExternalFileStore {
     ) -> Result<ExternalFile>;
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;
+    async fn readlink_external(&self, id: ObjID) -> Result<String>;
 
     async fn readdir_external(
         &self,

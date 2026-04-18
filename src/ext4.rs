@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use libc::mode_t;
+use libc::{PATH_MAX, mode_t};
 use lwext4_rs::{
     Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR,
 };
@@ -179,6 +179,13 @@ impl<D: Device> Ext4Store<D> {
 
     fn get_len_from_cache(&self, id: ObjID) -> Option<u64> {
         self.len_cache.lock().unwrap().get(&id).copied()
+    }
+
+    async fn readlink(&self, id: ObjID) -> Result<String> {
+        let mut buf = vec![0; PATH_MAX as usize];
+        let len = self.read_object(id, 0, &mut buf).await?;
+        buf.truncate(len);
+        String::from_utf8(buf).map_err(|_| ErrorKind::InvalidData.into())
     }
 
     fn invalidate_len(&self, id: ObjID) {
@@ -583,6 +590,10 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
         todo!()
+    }
+
+    async fn readlink_external(&self, at: ObjID) -> Result<String> {
+        self.readlink(at).await
     }
 
     async fn readdir_external(
