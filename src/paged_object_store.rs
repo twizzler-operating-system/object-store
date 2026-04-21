@@ -530,6 +530,7 @@ pub trait PagedObjectStore {
 }
 
 bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct ExternalOpenFlags: u32 {
         const READ = 0b0001;
         const WRITE = 0b0010;
@@ -553,6 +554,8 @@ pub trait ExternalFileStore {
     async fn readdir_external(
         &self,
         dir: ObjID,
+        skip: usize,
+        count: usize,
         entries: &mut std::vec::Vec<ExternalFile>,
     ) -> Result<()>;
 

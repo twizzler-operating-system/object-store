@@ -552,11 +552,20 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         flags: ExternalOpenFlags,
         mode: mode_t,
     ) -> Result<ExternalFile> {
-        let at_ino = if let Some(at) = at {
+        let mut at_ino = if let Some(at) = at {
             objid_to_ino(at).ok_or(ErrorKind::InvalidInput)?
         } else {
             2
         };
+        if at_ino < 2 {
+            at_ino = 2;
+        }
+        tracing::trace!(
+            "opening external file at {:?} with flags {:?} and mode {:o} at ino {}",
+            path.as_ref(),
+            flags,
+            mode, at_ino
+        );
 
         let mut fs = self.fs.lock().unwrap();
 
@@ -599,22 +608,31 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
     async fn readdir_external(
         &self,
         dir: ObjID,
+        skip: usize,
+        count: usize,
         entries: &mut std::vec::Vec<ExternalFile>,
     ) -> Result<()> {
+        entries.clear();
+        tracing::trace!(
+            "enumerating external namespace {:x} (skip {}, count {})",
+            dir,
+            skip,
+            count
+        );
         let mut fs = self.fs.lock().unwrap();
         let mut inonr = objid_to_ino(dir).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
             inonr = 2;
         }
 
-        //if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
-        //    return Ok(r);
-        //}
+ //       if let Some(_) =  self.ext_cache.lock().unwrap().readdir(inonr){
+  //          return Ok(r);
+   //     }
 
         let mut inode = fs.get_inode(inonr)?;
         let diriter = fs.dirents(&mut inode)?;
 
-        let diriter = diriter.filter_map(|de| {
+        let diriter = diriter.skip(skip).take(count).filter_map(|de| {
             de.1.ok().map(|ino| {
                 ExternalFile::new(
                     unsafe { str::from_utf8_unchecked(&de.0) },
@@ -625,8 +643,15 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         });
 
         for entry in diriter {
+            tracing::trace!("record external file {} in namespace {:x} with ID {} and kind {:?}",
+                entry.name().unwrap_or("<invalid utf8>"),
+                dir,
+                entry.id,
+                entry.kind
+            );
             entries.push(entry)
         }
+        tracing::trace!("collected {} entries", entries.len());
 
         Ok(())
 
