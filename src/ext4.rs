@@ -598,7 +598,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
     }
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
-        todo!()
+        return Ok(());
     }
 
     async fn readlink_external(&self, at: ObjID) -> Result<String> {
