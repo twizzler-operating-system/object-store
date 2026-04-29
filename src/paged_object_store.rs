@@ -546,6 +546,7 @@ pub trait ExternalFileStore {
         path: impl AsRef<Path>,
         flags: ExternalOpenFlags,
         mode: mode_t,
+        link_to: Option<ObjID>,
     ) -> Result<ExternalFile>;
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;

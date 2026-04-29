@@ -551,6 +551,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         path: impl AsRef<Path>,
         flags: ExternalOpenFlags,
         mode: mode_t,
+        link_to: Option<ObjID>,
     ) -> Result<ExternalFile> {
         let mut at_ino = if let Some(at) = at {
             objid_to_ino(at).ok_or(ErrorKind::InvalidInput)?
@@ -561,10 +562,11 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             at_ino = 2;
         }
         tracing::trace!(
-            "opening external file at {:?} with flags {:?} and mode {:o} at ino {}",
+            "opening external file at {:?} with flags {:?} and mode {:o} at ino {}, link_to = {:?}",
             path.as_ref(),
             flags,
             mode, at_ino
+            ,link_to
         );
 
         let mut fs = self.fs.lock().unwrap();
@@ -581,6 +583,13 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
 
         if flags.contains(ExternalOpenFlags::CREATE) {
             oflags |= O_CREAT;
+        }
+
+        if let Some(link_to) = link_to {
+            fs.link(path.as_ref().to_string_lossy().as_ref(),
+                at_ino,
+                objid_to_ino(link_to).ok_or(ErrorKind::InvalidInput)?,
+            ).inspect_err(|e| tracing::warn!("failed to link: {}", e))?;
         }
 
         let mut file = fs.open_file_from_container(
