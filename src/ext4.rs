@@ -1,15 +1,9 @@
 #[cfg(not(target_os = "twizzler"))]
 use std::io::Result;
 use std::{
-    collections::HashMap,
-    ffi::CString,
-    io::{ErrorKind, Read, Seek, SeekFrom, Write},
-    path::Path,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, MutexGuard,
-    },
-    time::Instant,
+    collections::HashMap,  ffi::CString, io::{ErrorKind, Read, Seek, SeekFrom, Write}, path::Path, sync::{
+        Mutex, MutexGuard, atomic::{AtomicU64, Ordering}
+    }, time::Instant
 };
 
 use libc::{PATH_MAX, mode_t};
@@ -73,7 +67,7 @@ impl ExtCache {
 
 pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
-    ext_cache: Mutex<ExtCache>,
+    //ext_cache: Mutex<ExtCache>,
     len_cache: Mutex<HashMap<ObjID, u64>>,
     device: D,
 }
@@ -172,7 +166,7 @@ impl<D: Device> Ext4Store<D> {
         Ok(Self {
             fs: Mutex::new(fs),
             device,
-            ext_cache: Mutex::new(ExtCache::default()),
+            //ext_cache: Mutex::new(ExtCache::default()),
             len_cache: Mutex::new(HashMap::default()),
         })
     }
@@ -534,10 +528,10 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
 
 impl<D: Device> Ext4Store<D> {
     pub async fn do_open_at(
-        at: Option<&ExternalFile>,
-        path: impl AsRef<Path>,
-        flags: ExternalOpenFlags,
-        mode: mode_t,
+        _at: Option<&ExternalFile>,
+        _path: impl AsRef<Path>,
+        _flags: ExternalOpenFlags,
+        _mode: mode_t,
     ) -> Result<ExternalFile> {
         // Implementation for openat
         unimplemented!()
@@ -607,6 +601,11 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
     }
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
+        if at.is_some() {
+            return Err(ErrorKind::Unsupported.into());
+        }
+        let mut fs = self.fs.lock().unwrap();
+        fs.remove_file(path.as_ref().to_string_lossy().as_ref())?;
         return Ok(());
     }
 
@@ -677,26 +676,26 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
 
     async fn link_external(
         &self,
-        file: &ExternalFile,
-        at: Option<ObjID>,
-        path: impl AsRef<Path>,
+        _file: &ExternalFile,
+        _at: Option<ObjID>,
+        _path: impl AsRef<Path>,
     ) -> Result<()> {
         todo!()
     }
 
-    async fn stat_external(&self, path: impl AsRef<Path>) -> Result<libc::stat> {
+    async fn stat_external(&self, _path: impl AsRef<Path>) -> Result<libc::stat> {
         todo!()
     }
 
-    async fn fstat_external(&self, file: Option<ObjID>) -> Result<libc::stat> {
+    async fn fstat_external(&self, _file: Option<ObjID>) -> Result<libc::stat> {
         todo!()
     }
 
     async fn symlink_external(
         &self,
-        at: Option<ObjID>,
-        target: impl AsRef<Path>,
-        linkpath: impl AsRef<Path>,
+        _at: Option<ObjID>,
+        _target: impl AsRef<Path>,
+        _linkpath: impl AsRef<Path>,
     ) -> Result<()> {
         todo!()
     }
