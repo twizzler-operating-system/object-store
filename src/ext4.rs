@@ -20,54 +20,9 @@ use crate::{
     PagedDevice, PagedObjectStore, PosIo, PAGE_SIZE,
 };
 
-#[derive(Default)]
-struct ExtCache {
-    ids: HashMap<ObjID, (ExternalFile, usize)>,
-    names: HashMap<u32, HashMap<String, (ExternalFile, usize)>>,
-}
-
-#[allow(dead_code)]
-impl ExtCache {
-    pub fn fill_dir(&mut self, ino: u32, items: impl Iterator<Item = (ExternalFile, usize)>) {
-        let entry = self.names.entry(ino).or_default();
-        for item in items {
-            if let Some(name) = item.0.name() {
-                entry.insert(name.to_owned(), item.clone());
-                self.ids.insert(item.0.id.into(), item);
-            }
-        }
-    }
-
-    /*
-    pub fn readdir(&self, ino: u32) -> Option<std::vec::Vec<ExternalFile>> {
-        let entry = self.names.get(&ino)?;
-        Some(entry.values().map(|e| e.0).collect())
-    }
-    */
-
-    pub fn reset_dir(&mut self, ino: u32) {
-        if let Some(mut map) = self.names.remove(&ino) {
-            for item in map.drain() {
-                self.ids.remove(&item.1 .0.id.into());
-            }
-        }
-    }
-
-    /*
-    pub fn lookup(&self, ino: u32, name: &str) -> Option<(ExternalFile, usize)> {
-        let map = self.names.get(&ino)?;
-        map.get(name).copied()
-    }
-
-    pub fn get_by_id(&self, id: ObjID) -> Option<(ExternalFile, usize)> {
-        self.ids.get(&id).copied()
-    }
-    */
-}
-
 pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
-    //ext_cache: Mutex<ExtCache>,
+    ino_cache: Mutex<HashMap<ObjID, u32>>,
     len_cache: Mutex<HashMap<ObjID, u64>>,
     device: D,
 }
@@ -166,8 +121,8 @@ impl<D: Device> Ext4Store<D> {
         Ok(Self {
             fs: Mutex::new(fs),
             device,
-            //ext_cache: Mutex::new(ExtCache::default()),
             len_cache: Mutex::new(HashMap::default()),
+            ino_cache: Mutex::new(HashMap::default()),
         })
     }
 
@@ -204,7 +159,19 @@ impl<D: Device> Ext4Store<D> {
         Ok(())
     }
 
-    pub fn get_object_as_file<'a>(
+    pub fn lookup_ino_cache(&self, id: ObjID) -> Option<u32> {
+        self.ino_cache.lock().unwrap().get(&id).copied()
+    }
+
+    pub fn insert_ino_cache(&self, id: ObjID, ino: u32) {
+        self.ino_cache.lock().unwrap().insert(id, ino);
+    }
+
+    pub fn remove_ino_cache(&self, id: ObjID) {
+        self.ino_cache.lock().unwrap().remove(&id);
+    }
+
+    fn do_get_object_as_file<'a>(
         &self,
         fs: &'a mut MutexGuard<'_, Ext4Fs>,
         id: ObjID,
@@ -224,6 +191,20 @@ impl<D: Device> Ext4Store<D> {
         }
         Ok(fs.open_file(&path.1, flags)?)
     }
+
+    pub fn get_object_as_file<'a>(
+        &self,
+        fs: &'a mut MutexGuard<'_, Ext4Fs>,
+        id: ObjID,
+        create: bool,
+    ) -> Result<Ext4File<'a>> {
+        if let Some(ino) = self.lookup_ino_cache(id) {
+            return Ok(fs.open_file_from_inode(ino, O_RDWR)?);
+        }
+        let mut file = self.do_get_object_as_file(fs, id, create)?;
+        self.insert_ino_cache(id, file.get_file_inode()?.num());
+        Ok(file)
+    }
 }
 
 impl<D: Device> PagedObjectStore for Ext4Store<D> {
@@ -238,6 +219,8 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let path = self.get_id_path(id);
         let mut fs = self.fs.lock().unwrap();
         fs.remove_file(&path.1)?;
+        self.remove_ino_cache(id);
+        self.invalidate_len(id);
         fs.flush()?;
         Ok(())
     }
@@ -478,64 +461,6 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         );
         Ok(reqs.len())
     }
-
-    /*
-    async fn enumerate_external(&self, id: ObjID) -> Result<std::vec::Vec<ExternalFile>> {
-        let mut fs = self.fs.lock().unwrap();
-        let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
-        if inonr == 0 {
-            inonr = 2;
-        }
-
-        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
-            return Ok(r);
-        }
-
-        let mut inode = fs.get_inode(inonr)?;
-        let diriter = fs.dirents(&mut inode)?;
-
-        let diriter = diriter.filter_map(|de| {
-            de.1.ok().map(|ino| {
-                (
-                    ExternalFile::new(&de.0, ino.kind().into(), ino_to_objid(ino.num())),
-                    ino.size() as usize,
-                )
-            })
-        });
-        self.ext_cache.lock().unwrap().reset_dir(inonr);
-        self.ext_cache.lock().unwrap().fill_dir(inonr, diriter);
-        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
-            Ok(r)
-        } else {
-            Err(ErrorKind::Other.into())
-        }
-    }
-
-    async fn find_external(&self, id: ObjID) -> Result<usize> {
-        let mut fs = self.fs.lock().unwrap();
-        let mut inonr = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
-        if inonr == 0 {
-            inonr = 2;
-        }
-        if let Some(info) = self.ext_cache.lock().unwrap().get_by_id(id) {
-            return Ok(info.1);
-        }
-        let inode = fs.get_inode(inonr)?;
-        Ok(inode.size() as usize)
-    }
-    */
-}
-
-impl<D: Device> Ext4Store<D> {
-    pub async fn do_open_at(
-        _at: Option<&ExternalFile>,
-        _path: impl AsRef<Path>,
-        _flags: ExternalOpenFlags,
-        _mode: mode_t,
-    ) -> Result<ExternalFile> {
-        // Implementation for openat
-        unimplemented!()
-    }
 }
 
 impl<D: Device> ExternalFileStore for Ext4Store<D> {
@@ -633,10 +558,6 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             inonr = 2;
         }
 
- //       if let Some(_) =  self.ext_cache.lock().unwrap().readdir(inonr){
-  //          return Ok(r);
-   //     }
-
         let mut inode = fs.get_inode(inonr)?;
         let diriter = fs.dirents(&mut inode)?;
 
@@ -662,16 +583,6 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         tracing::trace!("collected {} entries", entries.len());
 
         Ok(())
-
-        //self.ext_cache.lock().unwrap().reset_dir(inonr);
-        //self.ext_cache.lock().unwrap().fill_dir(inonr, diriter);
-        /*
-        if let Some(r) = self.ext_cache.lock().unwrap().readdir(inonr) {
-            Ok(r)
-        } else {
-            Err(ErrorKind::Other.into())
-        }
-        */
     }
 
     async fn link_external(
