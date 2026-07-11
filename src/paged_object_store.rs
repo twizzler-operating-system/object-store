@@ -238,6 +238,8 @@ pub trait PagedDevice {
     /// Append the needed paged phys mem for this device page, return the number of appended pages.
     async fn phys_addrs(
         &self,
+        _start_obj_page: i64,
+        _nr_obj_pages: u32,
         _start: DevicePage,
         _phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
     ) -> Result<usize> {
@@ -306,7 +308,7 @@ impl PageRequest {
         for page in disk_pages {
             let mut count = 0;
             while count < page.nr_pages() {
-                match device.phys_addrs(*page, &mut self.phys_list).await {
+                match device.phys_addrs(self.start_page, self.nr_pages, *page, &mut self.phys_list).await {
                     Ok(r) => {
                         if r == 0 {
                             break;
