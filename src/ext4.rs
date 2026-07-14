@@ -280,6 +280,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut iters = 0;
         drop(file);
         drop(fs);
+        let _time0 = Instant::now();
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
@@ -337,6 +338,9 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
+
+        let _time1 = Instant::now();
+        tracing::trace!("collecting blocks took {}ms", (_time1 - _time0).as_millis());
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
             tracing::trace!("paging in {:?}", pages);

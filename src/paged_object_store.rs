@@ -240,14 +240,14 @@ pub trait PagedDevice {
         &self,
         _start_obj_page: i64,
         _nr_obj_pages: u32,
-        _start: DevicePage,
+        _pages: &[DevicePage],
         _phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
-    ) -> Result<usize> {
+    ) -> Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    async fn sequential_read(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
-    async fn sequential_write(&self, start: u64, list: &[PhysRange]) -> Result<usize>;
+    async fn sequential_read(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
+    async fn sequential_write(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
 
     async fn len(&self) -> Result<usize>;
 
@@ -303,48 +303,48 @@ impl PageRequest {
         disk_pages: &[DevicePage],
         device: &PD,
     ) -> Result<()> {
-        // TODO: recover these
-        self.phys_list.clear();
-        for page in disk_pages {
-            let mut count = 0;
-            while count < page.nr_pages() {
-                match device.phys_addrs(self.start_page, self.nr_pages, *page, &mut self.phys_list).await {
-                    Ok(r) => {
-                        if r == 0 {
-                            break;
-                        }
-                        count += r;
-                    }
-                    Err(e) if Into::<std::io::Error>::into(e).kind() == ErrorKind::OutOfMemory => {
-                        if self.phys_list.is_empty() {
-                            tracing::error!(": {}", e);
-                            return Err(e);
-                        } else {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(": {}", e);
-                        Err(e)?
-                    }
-                }
-            }
+        tracing::trace!(
+            "setup_phys: start_page = {}, nr_pages = {}, disk_pages = {:?}",
+            self.start_page,
+            self.nr_pages,
+            disk_pages
+        );
+        let nr_pages = disk_pages.iter().fold(0usize, |acc, range| acc + range.nr_pages());
+        device.phys_addrs(self.start_page, nr_pages as u32, disk_pages, &mut self.phys_list).await?;
 
-            if count < page.nr_pages() {
-                break;
-            }
-        }
-
+        // We may have allocated fewer pages, so recalculate nr_pages.
         self.nr_pages =
             self.phys_list
                 .iter()
-                .fold(0usize, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
+                .fold(0usize, |acc, range| acc + range.nr_pages()).min(nr_pages) as u32;
         self.completed =
             self.phys_list
                 .iter()
                 .filter(|p| p.is_completed())
-                .fold(0usize, |acc, range| acc + range.len() / PAGE_SIZE) as u32;
+                .fold(0usize, |acc, range| acc + range.nr_pages()).min(nr_pages) as u32;
         Ok(())
+    }
+
+    fn advance(&mut self, mut cursor: usize, mut inner_cursor: usize, mut count: usize) -> (usize, usize) {
+        while count > 0 && cursor < self.phys_list.len() {
+            if self.phys_list[cursor].is_completed() {
+                cursor += 1;
+                inner_cursor = 0;
+                continue;
+            }
+            if count >= self.phys_list[cursor].nr_pages() - inner_cursor {
+                count -= self.phys_list[cursor].nr_pages() - inner_cursor;
+                self.phys_list[cursor].set_completed();
+                self.completed += self.phys_list[cursor].nr_pages() as u32;
+                cursor += 1;
+                inner_cursor = 0;
+            } else {
+                inner_cursor += count;
+                count = 0;
+            }
+        }
+
+        (cursor, inner_cursor)
     }
 
     pub async fn page_in<PD: PagedDevice>(
@@ -352,67 +352,43 @@ impl PageRequest {
         disk_pages: &[DevicePage],
         device: &PD,
     ) -> Result<usize> {
+        let _time0 = std::time::Instant::now();
         self.setup_phys(disk_pages, device).await?;
         if self.phys_list.iter().all(|p| p.is_completed()) {
             return Ok(self.nr_pages as usize);
         }
+        let _time1 = std::time::Instant::now();
 
-        let mut cursor = 0;
+        let mut cursor = self.phys_list.iter().position(|p| !p.is_completed()).unwrap_or(0);
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
-        let mut tmp: Vec<PhysRange, MAYHEAP_LEN> = Vec::new();
         for disk_page in disk_pages {
-            let mut count = 0;
-            tmp.clear();
-            while count < disk_page.nr_pages() {
-                let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+            tracing::trace!(
+                "page_in: disk_page = {:?}, cursor = {}, tfer_count = {}: {:?}",
+                disk_page,
+                cursor,
+                tfer_count,
+                &self.phys_list[cursor..]
+            );
+            let count = match disk_page {
+                DevicePage::Hole(len) =>  {
+                    (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize, );
+                    *len as usize
+                },
+                DevicePage::Run(start, len) => {
+                    let mut count = 0;
+                    while count < *len as usize {
+                        let r = device
+                            .sequential_read(*start + count as u64, *len as usize - count, &self.phys_list[cursor..], inner_cursor)
+                            .await
+                            .inspect_err(|e| tracing::error!("read err: {}", e))?;
 
-                let new_range = PhysRange {
-                    start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
-                    end: self.phys_list[cursor].range.start
-                        + (inner_cursor * PAGE_SIZE) as u64
-                        + (thislen * PAGE_SIZE) as u64,
-                };
-
-                tmp.push(new_range).unwrap();
-
-                inner_cursor += thislen;
-                if inner_cursor >= self.phys_list[cursor].nr_pages() {
-                    cursor += 1;
-                    inner_cursor = 0;
-                    if cursor >= self.phys_list.len() {
-                        break;
+                        (cursor, inner_cursor) = self.advance(cursor, inner_cursor, r);
+                        count += r;
                     }
+                    count
                 }
-
-                count += thislen;
-            }
-
-            if let DevicePage::Run(start, _len) = disk_page {
-                let mut count = 0;
-                let mut idx = 0;
-                while idx < tmp.len() {
-                    let mut r = device
-                        .sequential_read(*start + count as u64, &tmp[idx..])
-                        .await
-                        .inspect_err(|e| tracing::error!("read err: {}", e))?;
-
-                    while r > 0 {
-                        let thiscount: usize = tmp[idx].page_count().min(r);
-                        if tmp[idx].page_count() == thiscount {
-                            idx += 1;
-                        } else {
-                            tmp[idx] = PhysRange {
-                                start: tmp[idx].start + (thiscount * PAGE_SIZE) as u64,
-                                end: tmp[idx].end,
-                            };
-                        }
-                        r -= thiscount;
-                        count += thiscount;
-                    }
-                }
-            }
+            };
 
             tfer_count += count;
 
@@ -420,6 +396,9 @@ impl PageRequest {
                 break;
             }
         }
+        let _time2 = std::time::Instant::now();
+
+        tracing::trace!("timings: setup_phys = {}, page_in = {}", (_time1 - _time0).as_millis(), (_time2 - _time1).as_millis());
 
         Ok(tfer_count)
     }
@@ -429,62 +408,39 @@ impl PageRequest {
         disk_pages: &[DevicePage],
         device: &PD,
     ) -> Result<usize> {
-        let mut cursor = 0;
+        if self.phys_list.iter().all(|p| p.is_completed()) {
+            return Ok(self.nr_pages as usize);
+        }
+        let mut cursor = self.phys_list.iter().position(|p| !p.is_completed()).unwrap_or(0);
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
-        let mut tmp: Vec<PhysRange, MAYHEAP_LEN> = Vec::new();
         for disk_page in disk_pages {
-            let mut count = 0;
-            tmp.clear();
-            while count < disk_page.nr_pages() {
-                let thislen = (disk_page.nr_pages() - count)
-                    .min(self.phys_list[cursor].nr_pages() - inner_cursor);
+            tracing::trace!(
+                "page_out: disk_page = {:?}, cursor = {}, tfer_count = {}: {:?}",
+                disk_page,
+                cursor,
+                tfer_count,
+                &self.phys_list[cursor..]
+            );
+            let count = match disk_page {
+                DevicePage::Hole(len) =>  {
+                    (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize);
+                    *len as usize
+                },
+                DevicePage::Run(start, len) => {
+                    let mut count = 0;
+                    while count < *len as usize {
+                        let r = device
+                            .sequential_write(*start + count as u64, *len as usize - count, &self.phys_list[cursor..], inner_cursor)
+                            .await
+                            .inspect_err(|e| tracing::error!("write err: {}", e))?;
 
-                let new_range = PhysRange {
-                    start: self.phys_list[cursor].range.start + (inner_cursor * PAGE_SIZE) as u64,
-                    end: self.phys_list[cursor].range.start
-                        + (inner_cursor * PAGE_SIZE) as u64
-                        + (thislen * PAGE_SIZE) as u64,
-                };
-
-                tmp.push(new_range).unwrap();
-
-                inner_cursor += thislen;
-                if inner_cursor >= self.phys_list[cursor].nr_pages() {
-                    cursor += 1;
-                    inner_cursor = 0;
-                    if cursor >= self.phys_list.len() {
-                        break;
+                        (cursor, inner_cursor) = self.advance(cursor, inner_cursor, r);
+                        count += r;
                     }
+                    count
                 }
-
-                count += thislen;
-            }
-
-            if let DevicePage::Run(start, _len) = disk_page {
-                let mut count = 0;
-                let mut idx = 0;
-                while idx < tmp.len() {
-                    let mut r = device
-                        .sequential_write(*start + count as u64, &tmp[idx..])
-                        .await
-                        .inspect_err(|e| tracing::error!("write err: {}", e))?;
-
-                    while r > 0 {
-                        let thiscount: usize = tmp[idx].page_count().min(r);
-                        if tmp[idx].page_count() == thiscount {
-                            idx += 1;
-                        } else {
-                            tmp[idx] = PhysRange {
-                                start: tmp[idx].start + (thiscount * PAGE_SIZE) as u64,
-                                end: tmp[idx].end,
-                            };
-                        }
-                        r -= thiscount;
-                        count += thiscount;
-                    }
-                }
-            }
+            };
 
             tfer_count += count;
 
