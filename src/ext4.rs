@@ -366,6 +366,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut fs = self.fs.lock().unwrap();
         let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
+        tracing::trace!("paging out request for {} reqs, end_offset = {:?}, len = {}", reqs.len(), end_offset, file.len());
         if end_offset.unwrap_or(0) >= file.len() {
             drop(file);
             drop(fs);
@@ -432,6 +433,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                             dpg => DevicePage::Run(dpg, 1),
                         },
                     };
+                    tracing::trace!("paging out {:x} page {}: {:?}", id, page, item);
                     page += item.nr_pages() as i64;
                     if let Some(prev) = disk_pages.last_mut() {
                         if !prev.try_extend(&item) {
@@ -530,7 +532,12 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
     }
 
     async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
-        if at.is_some() {
+        tracing::trace!(
+            "unlinking external file at {:?} with path {:?}",
+            at,
+            path.as_ref()
+        );
+        if at.is_some_and(|at| at != 1) {
             return Err(ErrorKind::Unsupported.into());
         }
         let mut fs = self.fs.lock().unwrap();

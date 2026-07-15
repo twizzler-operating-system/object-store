@@ -246,6 +246,9 @@ pub trait PagedDevice {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
+    async fn free_phys_range(&self, _range: PhysRange)  {
+    }
+
     async fn sequential_read(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
     async fn sequential_write(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
 
@@ -400,6 +403,23 @@ impl PageRequest {
 
         tracing::trace!("timings: setup_phys = {}, page_in = {}", (_time1 - _time0).as_millis(), (_time2 - _time1).as_millis());
 
+        if tfer_count < self.phys_list.iter().fold(0usize, |acc, range| acc + range.nr_pages()) {
+            let truncate = cursor + 1;
+            while cursor < self.phys_list.len() {
+                let range = &mut self.phys_list[cursor];
+                let adj_range = PhysRange {
+                    start: range.range.start + inner_cursor as u64 * PAGE_SIZE as u64,
+                    end: range.range.end,
+                };
+                range.range = PhysRange {start: range.range.start, end: adj_range.start};
+                device.free_phys_range(adj_range).await;
+
+                cursor += 1;
+                inner_cursor = 0;
+            }
+            self.phys_list.truncate(truncate);
+        }
+
         Ok(tfer_count)
     }
 
@@ -424,6 +444,7 @@ impl PageRequest {
             );
             let count = match disk_page {
                 DevicePage::Hole(len) =>  {
+                    tracing::error!("page_out: encountered hole of length {} at cursor {}", len, cursor);
                     (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize);
                     *len as usize
                 },
