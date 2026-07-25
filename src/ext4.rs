@@ -189,7 +189,7 @@ impl<D: Device> Ext4Store<D> {
                 Err(e) => Err(e)?,
             }
         }
-        Ok(fs.open_file(&path.1, flags)?)
+        Ok(fs.open_file(&path.1, flags).map_err(|_| ErrorKind::NotFound)?)
     }
 
     pub fn get_object_as_file<'a>(
