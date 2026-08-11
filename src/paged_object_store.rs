@@ -1,7 +1,7 @@
 #![allow(async_fn_in_trait)]
 pub type ObjID = u128;
 
-use std::{future::Future, io::ErrorKind, ops::Add, path::Path, thread::yield_now};
+use std::{future::Future, io::ErrorKind, path::Path, thread::yield_now};
 
 use async_io::block_on;
 use libc::mode_t;
@@ -19,27 +19,6 @@ const PAGED_MEM_COMPLETED: u32 = 2;
 pub struct PagedPhysMem {
     pub range: PhysRange,
     flags: u32,
-}
-
-impl core::ops::Add<u64> for PagedPhysMem {
-    type Output = Self;
-
-    fn add(self, rhs: u64) -> Self::Output {
-        if rhs == 0 {
-            Self {
-                range: self.range,
-                flags: self.flags,
-            }
-        } else {
-            Self {
-                range: PhysRange {
-                    start: self.range.end,
-                    end: self.range.end + PAGE_SIZE as u64,
-                },
-                flags: self.flags,
-            }
-        }
-    }
 }
 
 impl PagedPhysMem {
@@ -79,6 +58,11 @@ impl PagedPhysMem {
 
     pub fn nr_pages(&self) -> usize {
         self.len() / PAGE_SIZE
+    }
+
+    /// True if `other` carries the same flags, so the two may be reported as one run.
+    pub fn same_flags(&self, other: &Self) -> bool {
+        self.flags == other.flags
     }
 }
 
@@ -232,6 +216,128 @@ mod tests {
             _ => panic!("Expected Run"),
         }
     }
+
+    struct MockDevice {
+        /// Total pages phys_addrs hands out, regardless of how many were asked for.
+        alloc_pages: usize,
+        /// Pages per phys_list entry.
+        alloc_chunk: usize,
+        /// If set, what a transfer reports instead of the actually-available count.
+        forced_tfer: Option<usize>,
+    }
+
+    impl PagedDevice for MockDevice {
+        async fn phys_addrs(
+            &self,
+            _start_obj_page: i64,
+            _nr_obj_pages: u32,
+            _pages: &[DevicePage],
+            phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
+        ) -> Result<()> {
+            let mut done = 0;
+            while done < self.alloc_pages {
+                let n = self.alloc_chunk.min(self.alloc_pages - done);
+                let start = (done * PAGE_SIZE) as u64;
+                phys_list
+                    .push(PagedPhysMem::new(PhysRange {
+                        start,
+                        end: start + (n * PAGE_SIZE) as u64,
+                    }))
+                    .unwrap();
+                done += n;
+            }
+            Ok(())
+        }
+
+        async fn sequential_read(
+            &self,
+            _start: u64,
+            nr_pages: usize,
+            list: &[PagedPhysMem],
+            inner_cursor: usize,
+        ) -> Result<usize> {
+            if let Some(forced) = self.forced_tfer {
+                return Ok(forced);
+            }
+            assert!(
+                !list.is_empty(),
+                "transfer issued with an exhausted phys list"
+            );
+            let avail = list.iter().fold(0usize, |acc, p| acc + p.nr_pages()) - inner_cursor;
+            Ok(nr_pages.min(avail))
+        }
+
+        async fn sequential_write(
+            &self,
+            start: u64,
+            nr_pages: usize,
+            list: &[PagedPhysMem],
+            inner_cursor: usize,
+        ) -> Result<usize> {
+            self.sequential_read(start, nr_pages, list, inner_cursor)
+                .await
+        }
+
+        async fn len(&self) -> Result<usize> {
+            Ok(self.alloc_pages * PAGE_SIZE)
+        }
+    }
+
+    /// A run longer than the phys memory we got must stop at the end of the list rather than
+    /// re-issuing transfers against an empty slice.
+    #[test]
+    fn test_page_in_short_phys_alloc() {
+        let dev = MockDevice {
+            alloc_pages: 4,
+            alloc_chunk: 4,
+            forced_tfer: None,
+        };
+        let mut req = PageRequest::new(0, 8);
+        let n = block_on(req.page_in(&[DevicePage::Run(100, 8)], &dev)).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(req.nr_pages, 4);
+    }
+
+    #[test]
+    fn test_page_out_short_phys_alloc() {
+        let dev = MockDevice {
+            alloc_pages: 4,
+            alloc_chunk: 4,
+            forced_tfer: None,
+        };
+        let mut req = PageRequest::new(0, 8);
+        block_on(req.setup_phys(&[DevicePage::Run(100, 8)], &dev)).unwrap();
+        let n = block_on(req.page_out(&[DevicePage::Run(100, 8)], &dev)).unwrap();
+        assert_eq!(n, 4);
+    }
+
+    /// A device reporting zero transferred pages is an error, not a reason to spin.
+    #[test]
+    fn test_page_in_no_progress_is_error() {
+        let dev = MockDevice {
+            alloc_pages: 8,
+            alloc_chunk: 8,
+            forced_tfer: Some(0),
+        };
+        let mut req = PageRequest::new(0, 8);
+        assert!(block_on(req.page_in(&[DevicePage::Run(100, 8)], &dev)).is_err());
+    }
+
+    /// Entries no page landed in are dropped, not retained as zero-length ranges.
+    #[test]
+    fn test_page_in_truncates_untouched_entries() {
+        let dev = MockDevice {
+            alloc_pages: 4,
+            alloc_chunk: 2,
+            forced_tfer: None,
+        };
+        let mut req = PageRequest::new(0, 2);
+        let n = block_on(req.page_in(&[DevicePage::Run(100, 2)], &dev)).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(req.phys_list.len(), 1);
+        assert_eq!(req.nr_pages, 2);
+        assert_eq!(req.completed, 2);
+    }
 }
 
 pub trait PagedDevice {
@@ -246,11 +352,22 @@ pub trait PagedDevice {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    async fn free_phys_range(&self, _range: PhysRange)  {
-    }
+    async fn free_phys_range(&self, _range: PhysRange) {}
 
-    async fn sequential_read(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
-    async fn sequential_write(&self, start: u64, nr_pages: usize, list: &[PagedPhysMem], inner_cursor: usize) -> Result<usize>;
+    async fn sequential_read(
+        &self,
+        start: u64,
+        nr_pages: usize,
+        list: &[PagedPhysMem],
+        inner_cursor: usize,
+    ) -> Result<usize>;
+    async fn sequential_write(
+        &self,
+        start: u64,
+        nr_pages: usize,
+        list: &[PagedPhysMem],
+        inner_cursor: usize,
+    ) -> Result<usize>;
 
     async fn len(&self) -> Result<usize>;
 
@@ -312,23 +429,39 @@ impl PageRequest {
             self.nr_pages,
             disk_pages
         );
-        let nr_pages = disk_pages.iter().fold(0usize, |acc, range| acc + range.nr_pages());
-        device.phys_addrs(self.start_page, nr_pages as u32, disk_pages, &mut self.phys_list).await?;
+        let nr_pages = disk_pages
+            .iter()
+            .fold(0usize, |acc, range| acc + range.nr_pages());
+        device
+            .phys_addrs(
+                self.start_page,
+                nr_pages as u32,
+                disk_pages,
+                &mut self.phys_list,
+            )
+            .await?;
 
         // We may have allocated fewer pages, so recalculate nr_pages.
-        self.nr_pages =
-            self.phys_list
-                .iter()
-                .fold(0usize, |acc, range| acc + range.nr_pages()).min(nr_pages) as u32;
-        self.completed =
-            self.phys_list
-                .iter()
-                .filter(|p| p.is_completed())
-                .fold(0usize, |acc, range| acc + range.nr_pages()).min(nr_pages) as u32;
+        self.nr_pages = self
+            .phys_list
+            .iter()
+            .fold(0usize, |acc, range| acc + range.nr_pages())
+            .min(nr_pages) as u32;
+        self.completed = self
+            .phys_list
+            .iter()
+            .filter(|p| p.is_completed())
+            .fold(0usize, |acc, range| acc + range.nr_pages())
+            .min(nr_pages) as u32;
         Ok(())
     }
 
-    fn advance(&mut self, mut cursor: usize, mut inner_cursor: usize, mut count: usize) -> (usize, usize) {
+    fn advance(
+        &mut self,
+        mut cursor: usize,
+        mut inner_cursor: usize,
+        mut count: usize,
+    ) -> (usize, usize) {
         while count > 0 && cursor < self.phys_list.len() {
             if self.phys_list[cursor].is_completed() {
                 cursor += 1;
@@ -362,7 +495,11 @@ impl PageRequest {
         }
         let _time1 = std::time::Instant::now();
 
-        let mut cursor = self.phys_list.iter().position(|p| !p.is_completed()).unwrap_or(0);
+        let mut cursor = self
+            .phys_list
+            .iter()
+            .position(|p| !p.is_completed())
+            .unwrap_or(0);
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
         for disk_page in disk_pages {
@@ -374,17 +511,37 @@ impl PageRequest {
                 &self.phys_list[cursor..]
             );
             let count = match disk_page {
-                DevicePage::Hole(len) =>  {
-                    (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize, );
+                DevicePage::Hole(len) => {
+                    (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize);
                     *len as usize
-                },
+                }
                 DevicePage::Run(start, len) => {
                     let mut count = 0;
                     while count < *len as usize {
+                        // setup_phys tolerates a short allocation, so we can run out of phys
+                        // memory partway through a run. Stop here and let the truncation path
+                        // below report what we actually transferred.
+                        if cursor >= self.phys_list.len() {
+                            break;
+                        }
                         let r = device
-                            .sequential_read(*start + count as u64, *len as usize - count, &self.phys_list[cursor..], inner_cursor)
+                            .sequential_read(
+                                *start + count as u64,
+                                *len as usize - count,
+                                &self.phys_list[cursor..],
+                                inner_cursor,
+                            )
                             .await
                             .inspect_err(|e| tracing::error!("read err: {}", e))?;
+                        if r == 0 {
+                            tracing::error!(
+                                "page_in: no progress reading {} pages at {} (cursor {})",
+                                *len as usize - count,
+                                *start + count as u64,
+                                cursor
+                            );
+                            return Err(ErrorKind::UnexpectedEof.into());
+                        }
 
                         (cursor, inner_cursor) = self.advance(cursor, inner_cursor, r);
                         count += r;
@@ -401,23 +558,52 @@ impl PageRequest {
         }
         let _time2 = std::time::Instant::now();
 
-        tracing::trace!("timings: setup_phys = {}, page_in = {}", (_time1 - _time0).as_millis(), (_time2 - _time1).as_millis());
+        tracing::trace!(
+            "timings: setup_phys = {}, page_in = {}",
+            (_time1 - _time0).as_millis(),
+            (_time2 - _time1).as_millis()
+        );
 
-        if tfer_count < self.phys_list.iter().fold(0usize, |acc, range| acc + range.nr_pages()) {
-            let truncate = cursor + 1;
+        if tfer_count
+            < self
+                .phys_list
+                .iter()
+                .fold(0usize, |acc, range| acc + range.nr_pages())
+        {
+            // With inner_cursor == 0 nothing landed in the entry at cursor, so drop it entirely
+            // rather than retaining a zero-length range that callers would count as no pages.
+            let truncate = if inner_cursor == 0 {
+                cursor
+            } else {
+                cursor + 1
+            };
             while cursor < self.phys_list.len() {
                 let range = &mut self.phys_list[cursor];
                 let adj_range = PhysRange {
                     start: range.range.start + inner_cursor as u64 * PAGE_SIZE as u64,
                     end: range.range.end,
                 };
-                range.range = PhysRange {start: range.range.start, end: adj_range.start};
+                range.range = PhysRange {
+                    start: range.range.start,
+                    end: adj_range.start,
+                };
                 device.free_phys_range(adj_range).await;
 
                 cursor += 1;
                 inner_cursor = 0;
             }
             self.phys_list.truncate(truncate);
+
+            // Keep the request self-consistent with the shortened list.
+            self.nr_pages =
+                self.phys_list
+                    .iter()
+                    .fold(0usize, |acc, range| acc + range.nr_pages()) as u32;
+            self.completed =
+                self.phys_list
+                    .iter()
+                    .filter(|p| p.is_completed())
+                    .fold(0usize, |acc, range| acc + range.nr_pages()) as u32;
         }
 
         Ok(tfer_count)
@@ -431,7 +617,11 @@ impl PageRequest {
         if self.phys_list.iter().all(|p| p.is_completed()) {
             return Ok(self.nr_pages as usize);
         }
-        let mut cursor = self.phys_list.iter().position(|p| !p.is_completed()).unwrap_or(0);
+        let mut cursor = self
+            .phys_list
+            .iter()
+            .position(|p| !p.is_completed())
+            .unwrap_or(0);
         let mut inner_cursor = 0;
         let mut tfer_count = 0;
         for disk_page in disk_pages {
@@ -443,18 +633,39 @@ impl PageRequest {
                 &self.phys_list[cursor..]
             );
             let count = match disk_page {
-                DevicePage::Hole(len) =>  {
-                    tracing::error!("page_out: encountered hole of length {} at cursor {}", len, cursor);
+                DevicePage::Hole(len) => {
+                    tracing::error!(
+                        "page_out: encountered hole of length {} at cursor {}",
+                        len,
+                        cursor
+                    );
                     (cursor, inner_cursor) = self.advance(cursor, inner_cursor, *len as usize);
                     *len as usize
-                },
+                }
                 DevicePage::Run(start, len) => {
                     let mut count = 0;
                     while count < *len as usize {
+                        if cursor >= self.phys_list.len() {
+                            break;
+                        }
                         let r = device
-                            .sequential_write(*start + count as u64, *len as usize - count, &self.phys_list[cursor..], inner_cursor)
+                            .sequential_write(
+                                *start + count as u64,
+                                *len as usize - count,
+                                &self.phys_list[cursor..],
+                                inner_cursor,
+                            )
                             .await
                             .inspect_err(|e| tracing::error!("write err: {}", e))?;
+                        if r == 0 {
+                            tracing::error!(
+                                "page_out: no progress writing {} pages at {} (cursor {})",
+                                *len as usize - count,
+                                *start + count as u64,
+                                cursor
+                            );
+                            return Err(ErrorKind::UnexpectedEof.into());
+                        }
 
                         (cursor, inner_cursor) = self.advance(cursor, inner_cursor, r);
                         count += r;
@@ -499,6 +710,23 @@ pub trait PagedObjectStore {
 
     async fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     async fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
+
+    /// Fill `out` with the device pages backing object pages `[start_page, start_page + nr_pages)`
+    /// of `id`.
+    ///
+    /// With `create`, holes in the range are allocated backing blocks, so `out` contains no
+    /// `DevicePage::Hole`. Without it, holes are reported as such.
+    ///
+    /// Not async: this is locks and arithmetic, and an implementation that caches its mappings can
+    /// answer entirely without touching the store's own locks.
+    fn get_disk_blocks(
+        &self,
+        id: ObjID,
+        start_page: u64,
+        nr_pages: u32,
+        create: bool,
+        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+    ) -> Result<()>;
 
     async fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
     async fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
@@ -555,24 +783,6 @@ pub trait ExternalFileStore {
         target: impl AsRef<Path>,
         linkpath: impl AsRef<Path>,
     ) -> Result<()>;
-}
-
-pub(crate) fn _consecutive_slices<T: PartialEq + Add<u64> + Copy>(
-    data: &[T],
-) -> impl Iterator<Item = &[T]>
-where
-    T::Output: PartialEq<T>,
-{
-    let mut slice_start = 0;
-    (1..=data.len()).flat_map(move |i| {
-        if i == data.len() || data[i - 1] + 1u64 != data[i] {
-            let begin = slice_start;
-            slice_start = i;
-            Some(&data[begin..i])
-        } else {
-            None
-        }
-    })
 }
 
 pub trait PosIo {

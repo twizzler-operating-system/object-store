@@ -1,14 +1,20 @@
 #[cfg(not(target_os = "twizzler"))]
 use std::io::Result;
 use std::{
-    collections::HashMap,  ffi::CString, io::{ErrorKind, Read, Seek, SeekFrom, Write}, path::Path, sync::{
-        Mutex, MutexGuard, atomic::{AtomicU64, Ordering}
-    }, time::Instant
+    collections::HashMap,
+    ffi::CString,
+    io::{ErrorKind, Read, Seek, SeekFrom, Write},
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, MutexGuard,
+    },
+    time::{Duration, Instant},
 };
 
-use libc::{PATH_MAX, mode_t};
+use libc::{mode_t, PATH_MAX};
 use lwext4_rs::{
-    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR,
+    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
 };
 use mayheap::Vec;
 use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
@@ -16,14 +22,23 @@ use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 use twizzler::Result;
 
 use crate::{
-    paged_object_store::MAYHEAP_LEN, DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID,
-    PagedDevice, PagedObjectStore, PosIo, PAGE_SIZE,
+    extents::{push_device_page, ExtentTracker},
+    paged_object_store::MAYHEAP_LEN,
+    DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID, PagedDevice, PagedObjectStore, PosIo,
+    PAGE_SIZE,
 };
 
 pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
     ino_cache: Mutex<HashMap<ObjID, u32>>,
-    len_cache: Mutex<HashMap<ObjID, u64>>,
+    /// `None` records a known-absent object, so a repeated probe costs a hashmap
+    /// lookup instead of a directory walk under the fs lock.
+    len_cache: Mutex<HashMap<ObjID, Option<u64>>>,
+    /// Cached object-page -> disk-block mappings. A request served from here never takes `fs`.
+    extents: ExtentTracker,
+    /// Validated equal to 1 at mount, but kept explicit so the page/block arithmetic below says
+    /// what it means without re-reading the superblock under the fs lock.
+    blocks_per_page: u32,
     device: D,
 }
 
@@ -55,6 +70,7 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
     }
 
     fn read(&mut self, buf: *mut u8, block: u64, bcount: u32) -> std::io::Result<u32> {
+        BD_STATS.reads.fetch_add(1, Ordering::Relaxed);
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
@@ -64,6 +80,14 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
 
     fn write(&mut self, buf: *const u8, block: u64, bcount: u32) -> std::io::Result<u32> {
         let start = block * PHYSICAL_BSIZE as u64;
+        BD_STATS.writes.fetch_add(1, Ordering::Relaxed);
+        BD_STATS
+            .write_bytes
+            .fetch_add(bcount as u64 * PHYSICAL_BSIZE as u64, Ordering::Relaxed);
+        if start < PAGE_SIZE as u64 {
+            // The superblock lives at byte 1024, i.e. inside page 0.
+            BD_STATS.sb_writes.fetch_add(1, Ordering::Relaxed);
+        }
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts(buf, len as usize) };
         let len = self.device.run_async(self.device.write(start, slice))?;
@@ -96,6 +120,246 @@ static BDEV_ID: AtomicU64 = AtomicU64::new(0);
 const LOGICAL_BSIZE: u32 = 512;
 const PHYSICAL_BSIZE: u32 = 512;
 
+/// Block lookups performed per acquisition of the fs lock, between yields.
+const BLOCKS_PER_LOCK: usize = 100;
+
+/// Extra blocks a read-side walk asks about beyond the request.
+///
+/// `ext4_extent_get_blocks` returns one whole contiguous run per call and stops at `max_blocks`, so
+/// asking only for the pages requested means the tracker learns exactly the requested range and
+/// nothing more -- and a forward-sequential reader, which asks for the *next* range every time, can
+/// then never hit the cache. Measured: 127 lookups covered 66 625 pages, so a wider ask rides the
+/// same tree walk and costs nothing.
+///
+/// Read side only. Widening the ask under `create` would allocate blocks nobody asked for.
+const EXTENT_READAHEAD_BLOCKS: u32 = 4096;
+
+/// Block index backing object page `page`. External files have no null page, so their object
+/// pages sit one block lower than an internal object's. Both paging paths and the page-out
+/// file-extension check go through here so they cannot disagree about the mapping.
+fn page_to_block(id: ObjID, page: u64) -> u64 {
+    if objid_to_ino(id).is_some() && page > 0 {
+        page - 1
+    } else {
+        page
+    }
+}
+
+/// Cumulative split of paging time between walking the ext4 block map (under the fs lock) and
+/// the actual device transfer, so the cost of block-map lookup is visible without per-call
+/// tracing.
+struct PageStats {
+    collect_ns: AtomicU64,
+    io_ns: AtomicU64,
+    calls: AtomicU64,
+}
+
+impl PageStats {
+    const fn new() -> Self {
+        Self {
+            collect_ns: AtomicU64::new(0),
+            io_ns: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+        }
+    }
+
+    // Lookup counts moved to EXTENTSTATS, which is where the walk now happens.
+    fn record(&self, what: &str, collect: Duration, io: Duration) {
+        self.collect_ns
+            .fetch_add(collect.as_nanos() as u64, Ordering::Relaxed);
+        self.io_ns
+            .fetch_add(io.as_nanos() as u64, Ordering::Relaxed);
+        let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        // Power-of-two cadence: always reports regardless of total call count, while staying
+        // sparse under load.
+        if calls.is_power_of_two() {
+            tracing::info!(
+                "PAGESTATS {}: {} calls, collect {}ms, io {}ms",
+                what,
+                calls,
+                self.collect_ns.load(Ordering::Relaxed) / 1_000_000,
+                self.io_ns.load(Ordering::Relaxed) / 1_000_000,
+            );
+        }
+    }
+}
+
+static PAGE_IN_STATS: PageStats = PageStats::new();
+static PAGE_OUT_STATS: PageStats = PageStats::new();
+
+/// Whether the extent tracker is actually keeping the block-map walk off the fs lock. Split by
+/// `create`, because page-out serving from cache is the case the tracker exists for: a repeated
+/// sync of the same dirty object re-walked every time before it.
+struct ExtentStats {
+    hit_pages: AtomicU64,
+    walk_pages: AtomicU64,
+    /// Pages answered by the past-EOF shortcut. Counted apart from `walk_pages` because they take
+    /// no fs lock *and* are deliberately never cached, so folding them into misses makes the hit
+    /// rate look far worse than the cache is actually doing.
+    eof_pages: AtomicU64,
+    create_hit_pages: AtomicU64,
+    create_walk_pages: AtomicU64,
+    walk_lookups: AtomicU64,
+    calls: AtomicU64,
+    /// Calls that found the object already carrying valid extents. Distinguishes "never revisited"
+    /// from "revisited at a fresh range".
+    warm_object_calls: AtomicU64,
+    /// Concurrency actually achieved: threads inside get_disk_blocks at once, and the subset of
+    /// those served wholly from cache -- i.e. holding only a per-object read lock, never `fs`.
+    inflight: AtomicU64,
+    max_inflight: AtomicU64,
+    cached_inflight: AtomicU64,
+    max_cached_inflight: AtomicU64,
+}
+
+impl ExtentStats {
+    const fn new() -> Self {
+        Self {
+            hit_pages: AtomicU64::new(0),
+            walk_pages: AtomicU64::new(0),
+            eof_pages: AtomicU64::new(0),
+            create_hit_pages: AtomicU64::new(0),
+            create_walk_pages: AtomicU64::new(0),
+            walk_lookups: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            warm_object_calls: AtomicU64::new(0),
+            inflight: AtomicU64::new(0),
+            max_inflight: AtomicU64::new(0),
+            cached_inflight: AtomicU64::new(0),
+            max_cached_inflight: AtomicU64::new(0),
+        }
+    }
+
+    /// Bump a gauge and keep its high-water mark. Racy by construction -- two threads can both
+    /// read a stale max -- which only ever under-reports concurrency, so it cannot manufacture the
+    /// result this is measuring.
+    fn enter(gauge: &AtomicU64, max: &AtomicU64) -> u64 {
+        let now = gauge.fetch_add(1, Ordering::AcqRel) + 1;
+        max.fetch_max(now, Ordering::AcqRel);
+        now
+    }
+
+    fn record(&self, create: bool, hit: u32, walked: u32, past_eof: u32, warm: bool) {
+        if warm {
+            self.warm_object_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        let (hits, walks) = if create {
+            (&self.create_hit_pages, &self.create_walk_pages)
+        } else {
+            (&self.hit_pages, &self.walk_pages)
+        };
+        hits.fetch_add(hit as u64, Ordering::Relaxed);
+        walks.fetch_add(walked as u64, Ordering::Relaxed);
+        self.eof_pages.fetch_add(past_eof as u64, Ordering::Relaxed);
+        let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls.is_power_of_two() {
+            tracing::info!(
+                "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free",
+                calls,
+                self.warm_object_calls.load(Ordering::Relaxed),
+                self.walk_lookups.load(Ordering::Relaxed),
+                self.hit_pages.load(Ordering::Relaxed),
+                self.walk_pages.load(Ordering::Relaxed),
+                self.eof_pages.load(Ordering::Relaxed),
+                self.create_hit_pages.load(Ordering::Relaxed),
+                self.create_walk_pages.load(Ordering::Relaxed),
+                self.max_inflight.load(Ordering::Relaxed),
+                self.max_cached_inflight.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+static EXTENT_STATS: ExtentStats = ExtentStats::new();
+
+/// Decrements a concurrency gauge on drop.
+struct GaugeGuard(&'static AtomicU64);
+
+impl Drop for GaugeGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ExtentStats {
+    fn in_flight(&'static self) -> GaugeGuard {
+        Self::enter(&self.inflight, &self.max_inflight);
+        GaugeGuard(&self.inflight)
+    }
+
+    fn cache_served(&'static self) -> GaugeGuard {
+        Self::enter(&self.cached_inflight, &self.max_cached_inflight);
+        GaugeGuard(&self.cached_inflight)
+    }
+}
+
+/// Block-device traffic, to size what `Ext4Fs::flush` actually costs: how much of it is the
+/// unconditional superblock rewrite (a partial-page write, so a read-modify-write on the way
+/// down) versus walking the dirty list one buffer at a time.
+struct BdStats {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    write_bytes: AtomicU64,
+    sb_writes: AtomicU64,
+    flushes: AtomicU64,
+    flush_ns: AtomicU64,
+    flush_reads: AtomicU64,
+    flush_writes: AtomicU64,
+}
+
+impl BdStats {
+    const fn new() -> Self {
+        Self {
+            reads: AtomicU64::new(0),
+            writes: AtomicU64::new(0),
+            write_bytes: AtomicU64::new(0),
+            sb_writes: AtomicU64::new(0),
+            flushes: AtomicU64::new(0),
+            flush_ns: AtomicU64::new(0),
+            flush_reads: AtomicU64::new(0),
+            flush_writes: AtomicU64::new(0),
+        }
+    }
+
+    fn record_flush(&self, dur: Duration, reads: u64, writes: u64) {
+        self.flush_ns
+            .fetch_add(dur.as_nanos() as u64, Ordering::Relaxed);
+        self.flush_reads.fetch_add(reads, Ordering::Relaxed);
+        self.flush_writes.fetch_add(writes, Ordering::Relaxed);
+        let n = self.flushes.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_power_of_two() {
+            tracing::info!(
+                "FLUSHSTATS: {} flushes, {}ms in flush; per flush: {:.1} bd-reads, {:.1} bd-writes;                  {} sb-writes; totals: {} bd-reads, {} bd-writes, {}KB written",
+                n,
+                self.flush_ns.load(Ordering::Relaxed) / 1_000_000,
+                self.flush_reads.load(Ordering::Relaxed) as f64 / n as f64,
+                self.flush_writes.load(Ordering::Relaxed) as f64 / n as f64,
+                self.sb_writes.load(Ordering::Relaxed),
+                self.reads.load(Ordering::Relaxed),
+                self.writes.load(Ordering::Relaxed),
+                self.write_bytes.load(Ordering::Relaxed) / 1024,
+            );
+        }
+    }
+}
+
+static BD_STATS: BdStats = BdStats::new();
+
+/// `Ext4Fs::flush` also rewrites the superblock via `ext4_fs_fini`, so time it as one unit.
+fn flush_fs(fs: &mut Ext4Fs) -> Result<()> {
+    let r0 = BD_STATS.reads.load(Ordering::Relaxed);
+    let w0 = BD_STATS.writes.load(Ordering::Relaxed);
+    let start = Instant::now();
+    let res = fs.flush();
+    let dur = Instant::now() - start;
+    BD_STATS.record_flush(
+        dur,
+        BD_STATS.reads.load(Ordering::Relaxed) - r0,
+        BD_STATS.writes.load(Ordering::Relaxed) - w0,
+    );
+    Ok(res?)
+}
+
 impl<D: Device> Ext4Store<D> {
     pub async fn new(device: D, name: &str) -> Result<Self> {
         let bdname = format!("blockdev-{}", BDEV_ID.fetch_add(1, Ordering::SeqCst));
@@ -118,15 +382,30 @@ impl<D: Device> Ext4Store<D> {
             _ => {}
         }
 
+        // The paging paths feed block counts into DevicePage, whose nr_pages() then advances a
+        // page cursor -- correct only while one page is one block. Fail at mount rather than
+        // silently mis-mapping every request.
+        let block_size = fs.block_size()? as usize;
+        if block_size != PAGE_SIZE {
+            tracing::error!(
+                "ext4 block size {} != page size {}; paging assumes one block per page",
+                block_size,
+                PAGE_SIZE
+            );
+            return Err(ErrorKind::Unsupported.into());
+        }
+
         Ok(Self {
             fs: Mutex::new(fs),
             device,
             len_cache: Mutex::new(HashMap::default()),
             ino_cache: Mutex::new(HashMap::default()),
+            extents: ExtentTracker::new(),
+            blocks_per_page: (PAGE_SIZE / block_size) as u32,
         })
     }
 
-    fn get_len_from_cache(&self, id: ObjID) -> Option<u64> {
+    fn get_len_from_cache(&self, id: ObjID) -> Option<Option<u64>> {
         self.len_cache.lock().unwrap().get(&id).copied()
     }
 
@@ -142,7 +421,11 @@ impl<D: Device> Ext4Store<D> {
     }
 
     fn set_len_in_cache(&self, id: ObjID, len: u64) {
-        self.len_cache.lock().unwrap().insert(id, len);
+        self.len_cache.lock().unwrap().insert(id, Some(len));
+    }
+
+    fn set_absent_in_cache(&self, id: ObjID) {
+        self.len_cache.lock().unwrap().insert(id, None);
     }
 
     pub fn get_id_path(&self, id: ObjID) -> (String, String) {
@@ -152,6 +435,9 @@ impl<D: Device> Ext4Store<D> {
     }
 
     pub fn set_len(&self, id: ObjID, len: u64) -> Result<()> {
+        // ftruncate frees blocks. The guard bumps on every exit path, so a `?` out of a
+        // partially-applied truncate cannot leave stale extents behind.
+        let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.truncate(len)?;
@@ -176,20 +462,112 @@ impl<D: Device> Ext4Store<D> {
         fs: &'a mut MutexGuard<'_, Ext4Fs>,
         id: ObjID,
         create: bool,
-    ) -> Result<Ext4File<'a>> {
+    ) -> std::io::Result<Ext4File<'a>> {
         let flags = if create { O_RDWR | O_CREAT } else { O_RDWR };
         if let Some(ino) = objid_to_ino(id) {
-            return Ok(fs.open_file_from_inode(ino, flags)?);
+            return fs.open_file_from_inode(ino, flags);
         }
         let path = self.get_id_path(id);
         if create {
             match fs.create_dir(&path.0) {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
-                Err(e) => Err(e)?,
+                Err(e) => return Err(e),
             }
         }
-        Ok(fs.open_file(&path.1, flags).map_err(|_| ErrorKind::NotFound)?)
+        // Propagate the real error kind. Flattening everything to NotFound hid device errors,
+        // and would make them indistinguishable from genuine absence for the negative cache.
+        fs.open_file(&path.1, flags)
+    }
+
+    /// Walk the ext4 block map for `[page, end)`, appending to `out` and recording what was learned
+    /// in `learned` for the caller to commit to the extent tracker.
+    ///
+    /// Holds the fs lock in `BLOCKS_PER_LOCK` chunks: an `Ext4InodeRef` points into lwext4's block
+    /// cache, which is not reentrant, so it must not outlive the lock.
+    fn walk_block_map(
+        &self,
+        id: ObjID,
+        mut page: u64,
+        end: u64,
+        create: bool,
+        learned: &mut std::vec::Vec<(u64, Option<u64>, u32)>,
+        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+    ) -> Result<()> {
+        let mut lookups = 0u64;
+        let res = 'chunks: loop {
+            let mut fs = self.fs.lock().unwrap();
+            let mut file = match self.get_object_as_file(&mut fs, id, false) {
+                Ok(file) => file,
+                Err(e) => break Err(e.into()),
+            };
+            let mut inode = match file.get_file_inode() {
+                Ok(inode) => inode,
+                Err(e) => break Err(e.into()),
+            };
+
+            for _ in 0..BLOCKS_PER_LOCK {
+                if page >= end {
+                    break 'chunks Ok(());
+                }
+
+                let block = page_to_block(id, page) as u32 * self.blocks_per_page;
+                let rem_blocks = (end - page) as u32 * self.blocks_per_page;
+                let ask = if create {
+                    rem_blocks
+                } else {
+                    rem_blocks.saturating_add(EXTENT_READAHEAD_BLOCKS)
+                };
+
+                lookups += 1;
+                let (pblock, nr_blocks) = match inode.get_data_blocks(block, ask, create) {
+                    Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
+                        ((dblock != 0).then_some(dblock), nr_dblk)
+                    }
+                    _ => match inode.get_data_block(block, create) {
+                        Ok(0) => (None, 1),
+                        Ok(dpg) => (Some(dpg), 1),
+                        Err(e) => {
+                            tracing::warn!("failed to get_data_block: {}", e);
+                            break 'chunks Err(e.into());
+                        }
+                    },
+                };
+
+                // Allocation was requested, so a hole here means the allocation silently did not
+                // happen -- writing to block 0 would corrupt the superblock.
+                if create && pblock.is_none() {
+                    tracing::warn!(
+                        "got unexpected zero block when paging out object {:x} page {}",
+                        id,
+                        page
+                    );
+                    break 'chunks Err(ErrorKind::Other.into());
+                }
+
+                // Cache the whole run, but hand back only the pages asked for: the readahead
+                // exists to make the *next* request a hit, not to widen this transfer.
+                learned.push((page, pblock, nr_blocks));
+                let emit = nr_blocks.min(rem_blocks);
+                push_device_page(
+                    out,
+                    match pblock {
+                        Some(pblock) => DevicePage::Run(pblock, emit),
+                        None => DevicePage::Hole(emit),
+                    },
+                );
+                page += emit as u64;
+            }
+
+            drop(inode);
+            drop(file);
+            drop(fs);
+            self.device.yield_now();
+        };
+        EXTENT_STATS
+            .walk_lookups
+            .fetch_add(lookups, Ordering::Relaxed);
+        res
     }
 
     pub fn get_object_as_file<'a>(
@@ -197,52 +575,96 @@ impl<D: Device> Ext4Store<D> {
         fs: &'a mut MutexGuard<'_, Ext4Fs>,
         id: ObjID,
         create: bool,
-    ) -> Result<Ext4File<'a>> {
+    ) -> std::io::Result<Ext4File<'a>> {
         if let Some(ino) = self.lookup_ino_cache(id) {
-            return Ok(fs.open_file_from_inode(ino, O_RDWR)?);
+            return fs.open_file_from_inode(ino, O_RDWR);
         }
         let mut file = self.do_get_object_as_file(fs, id, create)?;
-        self.insert_ino_cache(id, file.get_file_inode()?.num());
+        let ino = file.get_file_inode()?.num();
+        self.insert_ino_cache(id, ino);
         Ok(file)
     }
 }
 
 impl<D: Device> PagedObjectStore for Ext4Store<D> {
     async fn create_object(&self, id: crate::ObjID) -> Result<()> {
+        // An id can be re-created after deletion, and an external id can land on a recycled inode.
+        let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
-        self.get_object_as_file(&mut fs, id, true)?;
-        fs.flush()?;
+        let mut file = self.get_object_as_file(&mut fs, id, true)?;
+        let len = file.len();
+        drop(file);
+        self.set_len_in_cache(id, len);
+        flush_fs(&mut fs)?;
         Ok(())
     }
 
     async fn delete_object(&self, id: crate::ObjID) -> Result<()> {
+        if objid_to_ino(id).is_some() {
+            // An inode-derived ID has no synthetic ids/xx/... path; unlinking one goes through
+            // unlink_external. Say so rather than reporting a confusing NotFound.
+            return Err(ErrorKind::Unsupported.into());
+        }
+        let _inval = self.extents.invalidate_on_drop(id);
         let path = self.get_id_path(id);
         let mut fs = self.fs.lock().unwrap();
-        fs.remove_file(&path.1)?;
+        // Drop the caches before checking the result: a failed remove must not leave them
+        // pointing at an inode/length we can no longer trust.
         self.remove_ino_cache(id);
         self.invalidate_len(id);
-        fs.flush()?;
+        fs.remove_file(&path.1)?;
+        flush_fs(&mut fs)?;
+        self.set_absent_in_cache(id);
         Ok(())
     }
 
     async fn len(&self, id: crate::ObjID) -> Result<u64> {
-        if let Some(len) = self.get_len_from_cache(id) {
-            return Ok(len);
+        match self.get_len_from_cache(id) {
+            Some(Some(len)) => return Ok(len),
+            Some(None) => return Err(ErrorKind::NotFound.into()),
+            None => {}
         }
         let mut fs = self.fs.lock().unwrap();
-        let mut file = self.get_object_as_file(&mut fs, id, false)?;
-        self.set_len_in_cache(id, file.len());
-        Ok(file.len())
+        let mut file = match self.get_object_as_file(&mut fs, id, false) {
+            Ok(file) => file,
+            Err(e) => {
+                // Only a confirmed absence is cached, and only for internal IDs: a device error
+                // must stay retryable, and an external ID is derived from an inode number that
+                // ext4 reuses after unlink, so a negative there could outlive the file it
+                // described. Internal IDs are created solely by create_object, which writes a
+                // positive entry. External lookups skip the directory walk anyway, so they were
+                // never the expensive case this cache exists for.
+                if e.kind() == ErrorKind::NotFound && objid_to_ino(id).is_none() {
+                    self.set_absent_in_cache(id);
+                }
+                return Err(e.into());
+            }
+        };
+        let len = file.len();
+        drop(file);
+        self.set_len_in_cache(id, len);
+        Ok(len)
     }
 
     async fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.seek(SeekFrom::Start(offset))?;
-        Ok(file.read(buf)?)
+        // Deliberately not read_exact: callers (readlink) pass an oversized buffer and rely on
+        // the short count at EOF.
+        let mut total = 0;
+        while total < buf.len() {
+            match file.read(&mut buf[total..])? {
+                0 => break,
+                n => total += n,
+            }
+        }
+        Ok(total)
     }
 
     async fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
+        // ext4_fwrite may allocate, and the ensure_backing/truncate pair below certainly does.
+        let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if offset > file.len() {
@@ -251,14 +673,78 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             file.truncate(offset).inspect_err(|e| {
                 tracing::warn!("failed to initialize object to {}: {}", offset, e)
             })?;
-            self.invalidate_len(id);
         }
         file.seek(SeekFrom::Start(offset))?;
-        // TODO
-        file.write(buf)?;
+        file.write_all(buf)?;
+        // Any write can grow the file (page-out appends at exactly offset == len), so refresh the
+        // cache unconditionally -- a stale entry here clamps every subsequent page-in short.
+        let new_len = file.len();
         drop(file);
-        fs.flush()?;
+        self.set_len_in_cache(id, new_len);
+        flush_fs(&mut fs)?;
         Ok(())
+    }
+
+    async fn flush(&self) -> Result<()> {
+        let mut fs = self.fs.lock().unwrap();
+        Ok(fs.sync_super()?)
+    }
+
+    fn get_disk_blocks(
+        &self,
+        id: ObjID,
+        start_page: u64,
+        nr_pages: u32,
+        create: bool,
+        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+    ) -> Result<()> {
+        if nr_pages == 0 {
+            return Ok(());
+        }
+        let entry = self.extents.entry(id);
+        let _inflight = EXTENT_STATS.in_flight();
+
+        // The whole point: a range we already know is served under a read lock, without the fs
+        // lock and without an inode ref.
+        let (cached, warm) = entry.emit(start_page, nr_pages, create, out);
+        if cached == nr_pages {
+            // Held across nothing but the accounting here -- the read lock is already dropped --
+            // but the gauge is what shows several of these overlapping on different threads.
+            let _cached_inflight = EXTENT_STATS.cache_served();
+            EXTENT_STATS.record(create, cached, 0, 0, warm);
+            return Ok(());
+        }
+
+        let page = start_page + cached as u64;
+        let end = start_page + nr_pages as u64;
+
+        // Wholly past EOF: a hole, with no walk at all. Sourced from the length cache so the
+        // common case costs no fs lock; without a cached length we fall through to the walk, which
+        // is slower but correct. Deliberately not committed to the tracker -- i_size moves, and
+        // recomputing this is free.
+        if !create {
+            if let Some(Some(max_len)) = self.get_len_from_cache(id) {
+                let rem_blocks = (end - page) as u32 * self.blocks_per_page;
+                if rem_blocks > 64
+                    && page as usize * PAGE_SIZE >= (max_len as usize + PAGE_SIZE * 8)
+                {
+                    push_device_page(out, DevicePage::Hole(rem_blocks));
+                    EXTENT_STATS.record(create, cached, 0, rem_blocks, warm);
+                    return Ok(());
+                }
+            }
+        }
+
+        // Snapshot before the walk: a mutation racing us makes the commit a no-op rather than
+        // caching what we are about to read.
+        let generation = entry.generation();
+        let mut learned = std::vec::Vec::new();
+        let res = self.walk_block_map(id, page, end, create, &mut learned, out);
+        // Commit whatever the walk did establish, even on error -- those entries were read under
+        // the fs lock and are no less true for the walk having stopped.
+        entry.commit(generation, &learned);
+        EXTENT_STATS.record(create, cached, (end - page) as u32, 0, warm);
+        res
     }
 
     async fn page_in_object<'a>(
@@ -266,75 +752,20 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         id: ObjID,
         reqs: &'a mut [crate::PageRequest],
     ) -> Result<usize> {
-        let mut fs = self.fs.lock().unwrap();
-        let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
-        let mut file = self
-            .get_object_as_file(&mut fs, id, false)
-            .inspect_err(|e| tracing::error!("go err: {}", e))?;
-        let mut inode = file
-            .get_file_inode()
-            .inspect_err(|e| tracing::error!("gfi err: {}", e))?;
-        let max_len = inode.size();
         tracing::trace!("paging  in request for {} reqs", reqs.len());
 
-        let mut iters = 0;
-        drop(file);
-        drop(fs);
         let _time0 = Instant::now();
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
                 let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
-
-                let mut page = req.start_page;
-                let end = req.start_page + req.nr_pages as i64;
-
-                let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
-                if rem_blocks > 64
-                    && page as usize * PAGE_SIZE >= (max_len as usize + PAGE_SIZE * 8)
-                {
-                    let _ = disk_pages.push(DevicePage::Hole(rem_blocks));
-                } else {
-                    let mut fs = self.fs.lock().unwrap();
-                    while page < end {
-                        iters += 1;
-                        if iters % 100 == 0 {
-                            drop(fs);
-                            self.device.yield_now();
-                            fs = self.fs.lock().unwrap();
-                        }
-
-                        let mut block = page as u32;
-                        if objid_to_ino(id).is_some() && block > 0 {
-                            // External files don't have null pages
-                            block -= 1;
-                        }
-                        block = block * blocks_per_page as u32;
-                        let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
-
-                        let item = match inode.get_data_blocks(block, rem_blocks, false) {
-                            Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
-                                if dblock == 0 {
-                                    DevicePage::Hole(nr_dblk)
-                                } else {
-                                    DevicePage::Run(dblock, nr_dblk)
-                                }
-                            }
-                            _ => match inode.get_data_block(block, false)? {
-                                0 => DevicePage::Hole(1),
-                                dpg => DevicePage::Run(dpg, 1),
-                            },
-                        };
-                        page += item.nr_pages() as i64;
-                        if let Some(prev) = disk_pages.last_mut() {
-                            if !prev.try_extend(&item) {
-                                disk_pages.push(item).unwrap();
-                            }
-                        } else {
-                            disk_pages.push(item).unwrap();
-                        }
-                    }
-                }
+                self.get_disk_blocks(
+                    id,
+                    req.start_page as u64,
+                    req.nr_pages,
+                    false,
+                    &mut disk_pages,
+                )?;
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
@@ -346,6 +777,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             tracing::trace!("paging in {:?}", pages);
             let _len = br.0.page_in(pages, &self.device).await?;
         }
+        PAGE_IN_STATS.record("page_in", _time1 - _time0, Instant::now() - _time1);
 
         Ok(reqs.len())
     }
@@ -357,92 +789,52 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     ) -> Result<usize> {
         let end_offset = reqs
             .iter()
-            .max_by_key(|req| req.start_page as u64 + req.nr_pages as u64)
-            .map(|end_req| {
-                (end_req.start_page as u64 + end_req.nr_pages as u64) * PAGE_SIZE as u64
-            });
+            .map(|req| req.start_page as u64 + req.nr_pages as u64)
+            .max()
+            .map(|end_page| page_to_block(id, end_page) * PAGE_SIZE as u64);
 
         let start = Instant::now();
-        let mut fs = self.fs.lock().unwrap();
-        let blocks_per_page = PAGE_SIZE / fs.block_size()? as usize;
-        let mut file = self.get_object_as_file(&mut fs, id, false)?;
-        tracing::trace!("paging out request for {} reqs, end_offset = {:?}, len = {}", reqs.len(), end_offset, file.len());
-        if end_offset.unwrap_or(0) >= file.len() {
-            drop(file);
-            drop(fs);
-            self.write_object(id, end_offset.unwrap_or(0), &[0u8; PAGE_SIZE])
-                .await?;
-            fs = self.fs.lock().unwrap();
-        } else {
-            drop(file);
+        let needs_extend = {
+            let mut fs = self.fs.lock().unwrap();
+            let mut file = self.get_object_as_file(&mut fs, id, false)?;
+            tracing::trace!(
+                "paging out request for {} reqs, end_offset = {:?}, len = {}",
+                reqs.len(),
+                end_offset,
+                file.len()
+            );
+            end_offset.unwrap_or(0) > file.len()
+        };
+        if needs_extend {
+            let end_offset = end_offset.unwrap_or(0);
+            // i_size has to cover the pages about to be written, but lwext4's truncate only
+            // shrinks, so growth has to come from a write. Write one page *past* the end and
+            // then trim back to the exact length: the touched page is beyond the final size and
+            // is never one the device-direct transfers below write, so the cached zeros cannot
+            // race with them.
+            self.write_object(id, end_offset, &[0u8; PAGE_SIZE]).await?;
+            self.set_len(id, end_offset)?;
         }
-        let mut file = self.get_object_as_file(&mut fs, id, false)?;
-        let mut inode = file.get_file_inode()?;
-        drop(file);
-        drop(fs);
         tracing::trace!("paging out {:x} request for {} reqs", id, reqs.len());
 
         let setup_done = Instant::now();
-        let mut iters = 0;
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut fs = self.fs.lock().unwrap();
                 let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
-
-                let mut page = req.start_page;
-                let end = req.start_page + req.nr_pages as i64;
-                while page < end {
-                    let mut block = page as u32;
-                    tracing::trace!("paging out block {}",  block);
-                    if objid_to_ino(id).is_some() && block > 0 {
-                        // External files don't have null pages
-                        block -= 1;
-                    }
-
-                    iters += 1;
-                    if iters % 100 == 0 {
-                        drop(fs);
-                        self.device.yield_now();
-                        fs = self.fs.lock().unwrap();
-                    }
-
-                    block = block * blocks_per_page as u32;
-                    let rem_blocks = (end - page) as u32 * blocks_per_page as u32;
-
-                    let item = match inode.get_data_blocks(block, rem_blocks, true) {
-                        Ok((dblock, nr_dblk)) if nr_dblk > 0 => {
-                            if dblock == 0 {
-                                tracing::warn!(
-                                    "got unexpected zero block when paging out object {:x}",
-                                    id
-                                );
-                                Result::Err(ErrorKind::Other.into())?
-                            } else {
-                                DevicePage::Run(dblock, nr_dblk)
-                            }
-                        }
-                        _ => match inode.get_data_block(block, true).inspect_err(|e| tracing::warn!("failed to get_data_block: {}", e))? {
-                            0 => {
-                                tracing::warn!(
-                                    "got unexpected zero block when paging out object {:x} in fallback",
-                                    id
-                                );
-                                Result::Err(ErrorKind::Other.into())?
-                            }
-                            dpg => DevicePage::Run(dpg, 1),
-                        },
-                    };
-                    tracing::trace!("paging out {:x} page {}: {:?}", id, page, item);
-                    page += item.nr_pages() as i64;
-                    if let Some(prev) = disk_pages.last_mut() {
-                        if !prev.try_extend(&item) {
-                            disk_pages.push(item).unwrap();
-                        }
-                    } else {
-                        disk_pages.push(item).unwrap();
-                    }
-                }
+                self.get_disk_blocks(
+                    id,
+                    req.start_page as u64,
+                    req.nr_pages,
+                    true,
+                    &mut disk_pages,
+                )?;
+                tracing::trace!(
+                    "paging out {:x} from {}: {:?}",
+                    id,
+                    req.start_page,
+                    disk_pages
+                );
                 Result::Ok((req, disk_pages))
             })
             .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
@@ -457,8 +849,13 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             let _len = br.0.page_out(pages, &self.device).await?;
         }
         let mut fs = self.fs.lock().unwrap();
-        fs.flush()?;
+        flush_fs(&mut fs)?;
         let io_done = Instant::now();
+        PAGE_OUT_STATS.record(
+            "page_out",
+            blocks_found - setup_done,
+            io_done - blocks_found,
+        );
         tracing::trace!(
             "==> {}ms {}ms {}ms",
             (setup_done - start).as_millis(),
@@ -490,8 +887,9 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             "opening external file at {:?} with flags {:?} and mode {:o} at ino {}, link_to = {:?}",
             path.as_ref(),
             flags,
-            mode, at_ino
-            ,link_to
+            mode,
+            at_ino,
+            link_to
         );
 
         let mut fs = self.fs.lock().unwrap();
@@ -510,11 +908,17 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             oflags |= O_CREAT;
         }
 
+        if flags.contains(ExternalOpenFlags::TRUNCATE) {
+            oflags |= O_TRUNC;
+        }
+
         if let Some(link_to) = link_to {
-            fs.link(path.as_ref().to_string_lossy().as_ref(),
+            fs.link(
+                path.as_ref().to_string_lossy().as_ref(),
                 at_ino,
                 objid_to_ino(link_to).ok_or(ErrorKind::InvalidInput)?,
-            ).inspect_err(|e| tracing::warn!("failed to link: {}", e))?;
+            )
+            .inspect_err(|e| tracing::warn!("failed to link: {}", e))?;
         }
 
         let mut file = fs.open_file_from_container(
@@ -524,10 +928,20 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             mode,
         )?;
 
+        let id = ino_to_objid(file.get_file_inode()?.num());
+        // O_TRUNC frees blocks; O_CREAT can land on an inode ext4 recycled from a deleted file, so
+        // either way any extents held under this id are now wrong. The ObjID is not known until the
+        // open returns, hence the invalidation here rather than up front -- and hence a window
+        // between the truncate and the bump, which only TRUNCATE has, since a freshly created id is
+        // not known to anyone else until we return it.
+        if flags.intersects(ExternalOpenFlags::TRUNCATE | ExternalOpenFlags::CREATE) {
+            self.extents.entry(id).invalidate();
+        }
+
         Ok(ExternalFile::new(
             path.as_ref().to_string_lossy().to_string(),
             file.get_file_inode()?.kind().into(),
-            ino_to_objid(file.get_file_inode()?.num()),
+            id,
         ))
     }
 
@@ -537,11 +951,33 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             at,
             path.as_ref()
         );
-        if at.is_some_and(|at| at != 1) {
+        // ObjID 1 is the external root (ino_to_objid(0)); anything else is unsupported here.
+        if at.is_some_and(|at| objid_to_ino(at) != Some(0)) {
             return Err(ErrorKind::Unsupported.into());
         }
         let mut fs = self.fs.lock().unwrap();
-        fs.remove_file(path.as_ref().to_string_lossy().as_ref())?;
+        let name = path.as_ref().to_string_lossy();
+        // Resolve the inode before unlinking: an external ObjID is derived from it, and both
+        // caches are keyed on that ObjID. Leaving them populated is doubly wrong here, because
+        // ext4 reuses inode numbers -- a later file can land on the same ObjID and inherit this
+        // one's cached length. Best effort: a target we cannot open (a symlink, say) just leaves
+        // the caches as they are today.
+        let id = fs
+            .open_file(name.as_ref(), O_RDONLY)
+            .ok()
+            .and_then(|mut file| {
+                file.get_file_inode()
+                    .ok()
+                    .map(|ino| ino_to_objid(ino.num()))
+            });
+        let _inval = id.map(|id| self.extents.invalidate_on_drop(id));
+        if let Some(id) = id {
+            self.remove_ino_cache(id);
+            self.invalidate_len(id);
+        } else {
+            tracing::debug!("unlink_external: could not resolve inode for {:?}", name);
+        }
+        fs.remove_file(name.as_ref())?;
         return Ok(());
     }
 
@@ -572,18 +1008,21 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         let mut inode = fs.get_inode(inonr)?;
         let diriter = fs.dirents(&mut inode)?;
 
+        // Note: skipping entries here desynchronizes the caller's `skip` cursor from the
+        // underlying dirent order across calls, as the inode filter below already does.
         let diriter = diriter.skip(skip).take(count).filter_map(|de| {
-            de.1.ok().map(|ino| {
-                ExternalFile::new(
-                    unsafe { str::from_utf8_unchecked(&de.0) },
-                    ino.kind().into(),
-                    ino_to_objid(ino.num()),
-                )
-            })
+            // ext4 names are arbitrary non-NUL bytes. A lossy conversion would not round-trip
+            // through a later lookup, so drop names we cannot represent.
+            let name = core::str::from_utf8(&de.0)
+                .inspect_err(|_| tracing::warn!("skipping non-utf8 dirent in namespace {:x}", dir))
+                .ok()?;
+            de.1.ok()
+                .map(|ino| ExternalFile::new(name, ino.kind().into(), ino_to_objid(ino.num())))
         });
 
         for entry in diriter {
-            tracing::trace!("record external file {} in namespace {:x} with ID {} and kind {:?}",
+            tracing::trace!(
+                "record external file {} in namespace {:x} with ID {} and kind {:?}",
                 entry.name().unwrap_or("<invalid utf8>"),
                 dir,
                 entry.id,
