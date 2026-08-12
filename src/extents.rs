@@ -115,6 +115,20 @@ impl ExtentMap {
         (page - start) as u32
     }
 
+    /// Whether `emit` would serve all of `[start, start + nr)`. Walks the same runs without
+    /// building any output, for callers deciding whether to start the work at all.
+    fn covers(&self, start: u64, nr: u32) -> bool {
+        let end = start + nr as u64;
+        let mut page = start;
+        while page < end {
+            let Some((estart, ext)) = self.covering(page) else {
+                return false;
+            };
+            page += (ext.len as u64 - (page - estart)).min(end - page);
+        }
+        true
+    }
+
     /// Drop everything covering `[start, end)`, trimming entries that straddle either edge.
     fn punch(&mut self, start: u64, end: u64) {
         let mut removed: std::vec::Vec<u64> = std::vec::Vec::new();
@@ -266,6 +280,14 @@ impl ObjectExtents {
         (map.emit(start, nr, create, out), warm)
     }
 
+    /// Whether `[start, start + nr)` can be served entirely from here, i.e. whether a page-in of
+    /// that range would have to walk the block map under the fs lock.
+    pub fn covers(&self, start: u64, nr: u32) -> bool {
+        let generation = self.generation();
+        let map = self.map.read().unwrap();
+        map.generation == generation && map.covers(start, nr)
+    }
+
     /// Record extents learned by a walk that started at generation `generation`. A racing
     /// invalidation makes this a no-op: what we learned is already stale.
     pub fn commit(&self, generation: u64, learned: &[(u64, Option<u64>, u32)]) {
@@ -319,6 +341,14 @@ impl ExtentTracker {
             .unwrap()
             .get_or_insert(id, || Arc::new(ObjectExtents::new()))
             .clone()
+    }
+
+    /// The entry for `id` if there is one, without creating it or promoting it in the LRU.
+    ///
+    /// For probes: asking whether a range is cached must not evict the entry of some other object
+    /// to record that it wasn't, nor reorder the recency the real fillers established.
+    pub fn peek(&self, id: ObjID) -> Option<Arc<ObjectExtents>> {
+        self.objects.lock().unwrap().peek(&id).cloned()
     }
 
     /// Invalidate `id` when the returned guard drops.
@@ -381,6 +411,20 @@ mod tests {
         );
         // Under create the hole must be allocated, so the emit stops short of it.
         assert_eq!(runs(&emit(&map, 0, 6, true)), vec![(Some(100), 2)]);
+    }
+
+    #[test]
+    fn covers_agrees_with_emit() {
+        let mut map = ExtentMap::new(0);
+        map.insert(0, Some(100), 4);
+        map.insert(4, None, 2);
+
+        // Everything `emit` serves for a read, `covers` reports -- holes included, since a read
+        // needs no block for one.
+        assert!(map.covers(0, 6));
+        assert!(map.covers(3, 2));
+        assert!(!map.covers(0, 8));
+        assert!(!map.covers(6, 1));
     }
 
     #[test]

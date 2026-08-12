@@ -409,6 +409,30 @@ impl<D: Device> Ext4Store<D> {
         self.len_cache.lock().unwrap().get(&id).copied()
     }
 
+    /// Whether [Self::len] can answer without the fs lock.
+    pub fn len_is_cached(&self, id: ObjID) -> bool {
+        self.get_len_from_cache(id).is_some()
+    }
+
+    /// Whether paging in `[start_page, start_page + nr_pages)` would have to take the fs lock.
+    ///
+    /// That lock is global and is held across NVMe round trips (`pagerperf.md` 2), so a thread
+    /// that takes it can park for a whole disk transfer behind a thread of any other priority.
+    /// Callers that must not do that ask first and route the work elsewhere.
+    ///
+    /// Both inputs are read from caches under their own short locks, and both answer "yes" when
+    /// they don't know -- being wrong in that direction only costs the caller its shortcut. The
+    /// answer can also go stale between here and the work (an invalidation racing us), so this
+    /// bounds how often a caller blocks rather than guaranteeing it never does.
+    pub fn page_in_would_block(&self, id: ObjID, start_page: u64, nr_pages: u32) -> bool {
+        if !self.len_is_cached(id) {
+            return true;
+        }
+        self.extents
+            .peek(id)
+            .is_none_or(|entry| !entry.covers(start_page, nr_pages))
+    }
+
     async fn readlink(&self, id: ObjID) -> Result<String> {
         let mut buf = vec![0; PATH_MAX as usize];
         let len = self.read_object(id, 0, &mut buf).await?;
