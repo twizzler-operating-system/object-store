@@ -1032,17 +1032,23 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         let mut inode = fs.get_inode(inonr)?;
         let diriter = fs.dirents(&mut inode)?;
 
-        // Note: skipping entries here desynchronizes the caller's `skip` cursor from the
-        // underlying dirent order across calls, as the inode filter below already does.
-        let diriter = diriter.skip(skip).take(count).filter_map(|de| {
-            // ext4 names are arbitrary non-NUL bytes. A lossy conversion would not round-trip
-            // through a later lookup, so drop names we cannot represent.
-            let name = core::str::from_utf8(&de.0)
-                .inspect_err(|_| tracing::warn!("skipping non-utf8 dirent in namespace {:x}", dir))
-                .ok()?;
-            de.1.ok()
-                .map(|ino| ExternalFile::new(name, ino.kind().into(), ino_to_objid(ino.num())))
-        });
+        // Filter first, then skip: `skip` counts entries the caller was actually handed, so a
+        // dropped dirent does not desynchronize a cursor walking this namespace across calls. The
+        // iterator reads each inode either way, so skipping later costs nothing.
+        let diriter = diriter
+            .filter_map(|de| {
+                // ext4 names are arbitrary non-NUL bytes. A lossy conversion would not round-trip
+                // through a later lookup, so drop names we cannot represent.
+                let name = core::str::from_utf8(&de.0)
+                    .inspect_err(|_| {
+                        tracing::warn!("skipping non-utf8 dirent in namespace {:x}", dir)
+                    })
+                    .ok()?;
+                de.1.ok()
+                    .map(|ino| ExternalFile::new(name, ino.kind().into(), ino_to_objid(ino.num())))
+            })
+            .skip(skip)
+            .take(count);
 
         for entry in diriter {
             tracing::trace!(
