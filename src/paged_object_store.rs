@@ -73,8 +73,8 @@ pub enum DevicePage {
 }
 
 impl DevicePage {
-    pub fn from_array(array: &[u64]) -> Vec<Self, MAYHEAP_LEN> {
-        let mut tmp = Vec::<Self, MAYHEAP_LEN>::new();
+    pub fn from_array(array: &[u64]) -> Vec<Self, INLINE_LEN> {
+        let mut tmp = Vec::<Self, INLINE_LEN>::new();
         for item in array {
             let item = if *item == 0 {
                 DevicePage::Hole(1)
@@ -83,10 +83,10 @@ impl DevicePage {
             };
             if let Some(prev) = tmp.last_mut() {
                 if !prev.try_extend(&item) {
-                    tmp.push(item).unwrap();
+                    tmp.push(item);
                 }
             } else {
-                tmp.push(item).unwrap();
+                tmp.push(item);
             }
         }
         tmp
@@ -232,18 +232,16 @@ mod tests {
             _start_obj_page: i64,
             _nr_obj_pages: u32,
             _pages: &[DevicePage],
-            phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
+            phys_list: &mut Vec<PagedPhysMem, INLINE_LEN>,
         ) -> Result<()> {
             let mut done = 0;
             while done < self.alloc_pages {
                 let n = self.alloc_chunk.min(self.alloc_pages - done);
                 let start = (done * PAGE_SIZE) as u64;
-                phys_list
-                    .push(PagedPhysMem::new(PhysRange {
-                        start,
-                        end: start + (n * PAGE_SIZE) as u64,
-                    }))
-                    .unwrap();
+                phys_list.push(PagedPhysMem::new(PhysRange {
+                    start,
+                    end: start + (n * PAGE_SIZE) as u64,
+                }));
                 done += n;
             }
             Ok(())
@@ -347,7 +345,7 @@ pub trait PagedDevice {
         _start_obj_page: i64,
         _nr_obj_pages: u32,
         _pages: &[DevicePage],
-        _phys_list: &mut Vec<PagedPhysMem, MAYHEAP_LEN>,
+        _phys_list: &mut Vec<PagedPhysMem, INLINE_LEN>,
     ) -> Result<()> {
         Err(std::io::ErrorKind::Unsupported.into())
     }
@@ -380,15 +378,24 @@ pub trait PagedDevice {
     }
 }
 
-use mayheap::Vec;
+/// A vector that keeps its first `N` elements inline and only reaches the allocator past that.
+///
+/// This was `mayheap::Vec`, which is only inline when built with its `heapless` backend; under the
+/// default `alloc` feature it is a plain `Vec` whose `new()` *eagerly* reserves `N`. Every
+/// construction was therefore an allocation, on paths that build one per page-in request and one
+/// per dirty page during a sync. `SmallVec` gives the intended shape -- inline while small, heap
+/// only when a list genuinely outgrows `N` -- and its `push` is infallible, so the callers that
+/// were unwrapping a `Result` that could not fail no longer have to.
+pub type Vec<T, const N: usize> = smallvec::SmallVec<[T; N]>;
 
-pub const MAYHEAP_LEN: usize = 16;
+/// Inline capacity for the per-request page and extent lists.
+pub const INLINE_LEN: usize = 16;
 #[derive(Debug)]
 pub struct PageRequest {
     pub start_page: i64,
     pub nr_pages: u32,
     pub completed: u32,
-    pub phys_list: Vec<PagedPhysMem, MAYHEAP_LEN>,
+    pub phys_list: Vec<PagedPhysMem, INLINE_LEN>,
 }
 
 impl PageRequest {
@@ -402,7 +409,7 @@ impl PageRequest {
     }
 
     pub fn new_from_list(
-        phys_list: Vec<PagedPhysMem, MAYHEAP_LEN>,
+        phys_list: Vec<PagedPhysMem, INLINE_LEN>,
         start_page: i64,
         nr_pages: u32,
     ) -> Self {
@@ -414,7 +421,7 @@ impl PageRequest {
         }
     }
 
-    pub fn into_list(self) -> Vec<PagedPhysMem, MAYHEAP_LEN> {
+    pub fn into_list(self) -> Vec<PagedPhysMem, INLINE_LEN> {
         self.phys_list
     }
 
@@ -725,7 +732,7 @@ pub trait PagedObjectStore {
         start_page: u64,
         nr_pages: u32,
         create: bool,
-        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+        out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> Result<()>;
 
     async fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;

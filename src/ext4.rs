@@ -16,14 +16,13 @@ use libc::{mode_t, PATH_MAX};
 use lwext4_rs::{
     Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
 };
-use mayheap::Vec;
 use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 #[cfg(target_os = "twizzler")]
 use twizzler::Result;
 
 use crate::{
     extents::{push_device_page, ExtentTracker},
-    paged_object_store::MAYHEAP_LEN,
+    paged_object_store::{Vec, INLINE_LEN},
     DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID, PagedDevice, PagedObjectStore, PosIo,
     PAGE_SIZE,
 };
@@ -434,9 +433,15 @@ impl<D: Device> Ext4Store<D> {
     }
 
     async fn readlink(&self, id: ObjID) -> Result<String> {
-        let mut buf = vec![0; PATH_MAX as usize];
-        let len = self.read_object(id, 0, &mut buf).await?;
-        buf.truncate(len);
+        // By inode rather than through `read_object`: a target short enough to live in the inode's
+        // block map is stored there with no data block behind it, so reading one as file data
+        // yields a block of unrelated bytes -- which, being zeros, is valid UTF-8 and passes for a
+        // 4096-byte target rather than failing outright.
+        let ino = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
+        let buf = self.fs.lock().unwrap().readlink_from_inode(ino)?;
+        if buf.len() > PATH_MAX as usize {
+            return Err(ErrorKind::InvalidData.into());
+        }
         String::from_utf8(buf).map_err(|_| ErrorKind::InvalidData.into())
     }
 
@@ -515,8 +520,8 @@ impl<D: Device> Ext4Store<D> {
         mut page: u64,
         end: u64,
         create: bool,
-        learned: &mut std::vec::Vec<(u64, Option<u64>, u32)>,
-        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+        learned: &mut Vec<(u64, Option<u64>, u32), INLINE_LEN>,
+        out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> Result<()> {
         let mut lookups = 0u64;
         let res = 'chunks: loop {
@@ -720,7 +725,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         start_page: u64,
         nr_pages: u32,
         create: bool,
-        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+        out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> Result<()> {
         if nr_pages == 0 {
             return Ok(());
@@ -762,7 +767,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         // Snapshot before the walk: a mutation racing us makes the commit a no-op rather than
         // caching what we are about to read.
         let generation = entry.generation();
-        let mut learned = std::vec::Vec::new();
+        let mut learned = Vec::<_, INLINE_LEN>::new();
         let res = self.walk_block_map(id, page, end, create, &mut learned, out);
         // Commit whatever the walk did establish, even on error -- those entries were read under
         // the fs lock and are no less true for the walk having stopped.
@@ -782,7 +787,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
+                let mut disk_pages = Vec::<DevicePage, INLINE_LEN>::new();
                 self.get_disk_blocks(
                     id,
                     req.start_page as u64,
@@ -792,7 +797,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 )?;
                 Result::Ok((req, disk_pages))
             })
-            .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
+            .try_collect::<std::vec::Vec<_>>()?;
 
         let _time1 = Instant::now();
         tracing::trace!("collecting blocks took {}ms", (_time1 - _time0).as_millis());
@@ -845,7 +850,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let mut blocks = reqs
             .iter_mut()
             .map(|req| {
-                let mut disk_pages = Vec::<DevicePage, MAYHEAP_LEN>::new();
+                let mut disk_pages = Vec::<DevicePage, INLINE_LEN>::new();
                 self.get_disk_blocks(
                     id,
                     req.start_page as u64,
@@ -861,7 +866,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 );
                 Result::Ok((req, disk_pages))
             })
-            .try_collect::<Vec<_, MAYHEAP_LEN>>()?;
+            .try_collect::<std::vec::Vec<_>>()?;
         tracing::trace!(
             "found blocks for paging out in {}ms",
             (Instant::now() - setup_done).as_millis()
@@ -1044,8 +1049,23 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
                         tracing::warn!("skipping non-utf8 dirent in namespace {:x}", dir)
                     })
                     .ok()?;
-                de.1.ok()
-                    .map(|ino| ExternalFile::new(name, ino.kind().into(), ino_to_objid(ino.num())))
+                // A dirent whose inode will not load is data loss in a listing, so say so rather
+                // than dropping it silently.
+                let ino =
+                    de.1.inspect_err(|err| {
+                        tracing::warn!(
+                            "skipping dirent {} in namespace {:x}, no inode: {}",
+                            name,
+                            dir,
+                            err
+                        )
+                    })
+                    .ok()?;
+                Some(ExternalFile::new(
+                    name,
+                    ino.kind().into(),
+                    ino_to_objid(ino.num()),
+                ))
             })
             .skip(skip)
             .take(count);

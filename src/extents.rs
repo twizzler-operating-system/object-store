@@ -19,9 +19,11 @@ use std::{
 };
 
 use lru::LruCache;
-use mayheap::Vec;
 
-use crate::{paged_object_store::MAYHEAP_LEN, DevicePage, ObjID};
+use crate::{
+    paged_object_store::{Vec, INLINE_LEN},
+    DevicePage, ObjID,
+};
 
 /// Objects tracked before the least-recently-used is dropped.
 const MAX_TRACKED_OBJECTS: usize = 1024;
@@ -30,15 +32,13 @@ const MAX_TRACKED_OBJECTS: usize = 1024;
 const MAX_EXTENTS_PER_OBJECT: usize = 64;
 
 /// Append `item` to `out`, merging it into the previous entry when the two are contiguous.
-pub fn push_device_page(out: &mut Vec<DevicePage, MAYHEAP_LEN>, item: DevicePage) {
+pub fn push_device_page(out: &mut Vec<DevicePage, INLINE_LEN>, item: DevicePage) {
     if let Some(prev) = out.last_mut() {
         if prev.try_extend(&item) {
             return;
         }
     }
-    // Infallible while mayheap resolves with `alloc`; the expect fires loudly if that changes,
-    // rather than silently dropping a run and mis-mapping the transfer.
-    out.push(item).expect("device page list is heap-backed");
+    out.push(item);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,7 +94,7 @@ impl ExtentMap {
         start: u64,
         nr: u32,
         create: bool,
-        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+        out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> u32 {
         let end = start + nr as u64;
         let mut page = start;
@@ -269,7 +269,7 @@ impl ObjectExtents {
         start: u64,
         nr: u32,
         create: bool,
-        out: &mut Vec<DevicePage, MAYHEAP_LEN>,
+        out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> (u32, bool) {
         let generation = self.generation();
         let map = self.map.read().unwrap();
@@ -368,7 +368,7 @@ mod tests {
     use super::*;
 
     fn emit(map: &ExtentMap, start: u64, nr: u32, create: bool) -> std::vec::Vec<DevicePage> {
-        let mut out = Vec::<DevicePage, MAYHEAP_LEN>::new();
+        let mut out = Vec::<DevicePage, INLINE_LEN>::new();
         map.emit(start, nr, create, &mut out);
         out.iter().copied().collect()
     }
@@ -486,11 +486,11 @@ mod tests {
         let generation = obj.generation();
         obj.commit(generation, &[(0, Some(100), 4)]);
 
-        let mut out = Vec::<DevicePage, MAYHEAP_LEN>::new();
+        let mut out = Vec::<DevicePage, INLINE_LEN>::new();
         assert_eq!(obj.emit(0, 4, false, &mut out).0, 4);
 
         obj.invalidate();
-        let mut out = Vec::<DevicePage, MAYHEAP_LEN>::new();
+        let mut out = Vec::<DevicePage, INLINE_LEN>::new();
         assert_eq!(obj.emit(0, 4, false, &mut out).0, 0);
     }
 
@@ -502,7 +502,7 @@ mod tests {
         obj.invalidate();
         obj.commit(generation, &[(0, Some(100), 4)]);
 
-        let mut out = Vec::<DevicePage, MAYHEAP_LEN>::new();
+        let mut out = Vec::<DevicePage, INLINE_LEN>::new();
         assert_eq!(obj.emit(0, 4, false, &mut out).0, 0);
     }
 }
