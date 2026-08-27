@@ -715,6 +715,11 @@ pub trait PagedObjectStore {
 
     async fn len(&self, id: ObjID) -> Result<u64>;
 
+    /// Store-recorded modification time (seconds) for `id`, or 0 when the backend keeps none.
+    async fn mtime(&self, _id: ObjID) -> Result<u32> {
+        Ok(0)
+    }
+
     async fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     async fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 

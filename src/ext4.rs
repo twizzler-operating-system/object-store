@@ -14,7 +14,8 @@ use std::{
 
 use libc::{mode_t, PATH_MAX};
 use lwext4_rs::{
-    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, MpLock, O_CREAT, O_RDONLY, O_RDWR, O_TRUNC,
+    Ext4Blockdev, Ext4BlockdevIface, Ext4File, Ext4Fs, FileKind, MpLock, O_CREAT, O_RDONLY, O_RDWR,
+    O_TRUNC,
 };
 use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 #[cfg(target_os = "twizzler")]
@@ -345,6 +346,26 @@ impl BdStats {
 static BD_STATS: BdStats = BdStats::new();
 
 /// `Ext4Fs::flush` also rewrites the superblock via `ext4_fs_fini`, so time it as one unit.
+/// Log an lwext4 error's raw errno, which is the only place it still exists.
+///
+/// `lwext4-rs` builds these with `io::Error::from_raw_os_error` on a POSIX errno, but Twizzler's
+/// `decode_error_kind` reads that integer as a packed `(category << 16) | code` TwzError. Every
+/// POSIX errno is below 65536, so the category is always 0 -- `Uncategorized` -- and the kind is
+/// always `Other`: ENOENT, EIO, ENOSPC and EEXIST are one value by the time anything logs them.
+/// `raw_os_error` survives; only `kind()` destroys it. Without this, a failed create is
+/// indistinguishable from a full disk or a device error, which is why five of them went
+/// unattributed.
+fn log_ext4_errno(op: &str, id: ObjID, e: std::io::Error) -> std::io::Error {
+    tracing::warn!(
+        "ext4 {} of {:x} failed: errno {:?}, kind {:?}",
+        op,
+        id,
+        e.raw_os_error(),
+        e.kind()
+    );
+    e
+}
+
 fn flush_fs(fs: &mut Ext4Fs) -> Result<()> {
     let r0 = BD_STATS.reads.load(Ordering::Relaxed);
     let w0 = BD_STATS.writes.load(Ordering::Relaxed);
@@ -486,6 +507,63 @@ impl<D: Device> Ext4Store<D> {
         self.ino_cache.lock().unwrap().remove(&id);
     }
 
+    /// Kind of the entry `name` inside directory inode `dir_ino`, if it is there.
+    ///
+    /// Read from the parent's dirents rather than by opening the child: opening a directory or a
+    /// symlink does not necessarily succeed, and the caller needs the answer precisely for the
+    /// cases an open would not give it.
+    fn child_kind(fs: &mut MutexGuard<'_, Ext4Fs>, dir_ino: u32, name: &str) -> Option<FileKind> {
+        let mut inode = fs.get_inode(dir_ino).ok()?;
+        let target = name.as_bytes();
+        fs.dirents(&mut inode)
+            .ok()?
+            .find(|(nm, _)| nm.as_slice() == target)
+            .and_then(|(_, iref)| iref.ok().map(|i| i.kind()))
+    }
+
+    /// Mount-relative path of `name` inside directory inode `dir_ino`.
+    ///
+    /// ext4 keeps no parent pointer in the inode, but a directory always carries a `..` entry and
+    /// -- unlike a file -- can have only one link, so walking up and naming each child in its
+    /// parent yields the one true path. Read-only: it touches no metadata.
+    fn path_of(fs: &mut MutexGuard<'_, Ext4Fs>, dir_ino: u32, name: &str) -> Result<String> {
+        const ROOT_INO: u32 = 2;
+        // Depth bound rather than a visited set: a corrupted `..` cycle must terminate, and no
+        // legitimate tree here is anywhere near this deep.
+        const MAX_DEPTH: usize = 64;
+
+        let mut parts: std::vec::Vec<String> = std::vec::Vec::new();
+        let mut ino = dir_ino;
+        while ino != ROOT_INO {
+            if parts.len() >= MAX_DEPTH {
+                return Err(ErrorKind::InvalidInput.into());
+            }
+            let parent = {
+                let mut inode = fs.get_inode(ino)?;
+                fs.dirents(&mut inode)?
+                    .find(|(nm, _)| nm.as_slice() == b"..")
+                    .and_then(|(_, iref)| iref.ok().map(|i| i.num()))
+                    .ok_or(ErrorKind::InvalidInput)?
+            };
+            let mut parent_inode = fs.get_inode(parent)?;
+            let component = fs
+                .dirents(&mut parent_inode)?
+                .filter(|(nm, _)| nm.as_slice() != b"." && nm.as_slice() != b"..")
+                .find(|(_, iref)| iref.as_ref().is_ok_and(|i| i.num() == ino))
+                .map(|(nm, _)| nm)
+                .ok_or(ErrorKind::InvalidInput)?;
+            // ext4 names are arbitrary non-NUL bytes; one that is not UTF-8 cannot be spliced into
+            // a path string, and a lossy conversion would name a different file.
+            parts.push(String::from_utf8(component).map_err(|_| ErrorKind::InvalidInput)?);
+            ino = parent;
+        }
+        parts.reverse();
+        parts.push(name.to_string());
+        // No leading slash: the mount point is "/" and `remove_file` prepends it, so returning
+        // one here would build "//sysroot/x" and resolve against the wrong path.
+        Ok(parts.join("/"))
+    }
+
     fn do_get_object_as_file<'a>(
         &self,
         fs: &'a mut MutexGuard<'_, Ext4Fs>,
@@ -620,11 +698,13 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         // An id can be re-created after deletion, and an external id can land on a recycled inode.
         let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
-        let mut file = self.get_object_as_file(&mut fs, id, true)?;
+        let mut file = self
+            .get_object_as_file(&mut fs, id, true)
+            .map_err(|e| log_ext4_errno("create", id, e))?;
         let len = file.len();
         drop(file);
         self.set_len_in_cache(id, len);
-        flush_fs(&mut fs)?;
+        flush_fs(&mut fs).inspect_err(|e| tracing::warn!("ext4 flush after create of {:x} failed: {}", id, e))?;
         Ok(())
     }
 
@@ -645,6 +725,15 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         flush_fs(&mut fs)?;
         self.set_absent_in_cache(id);
         Ok(())
+    }
+
+    async fn mtime(&self, id: crate::ObjID) -> Result<u32> {
+        // Only external (ino-backed) files carry a store mtime; native objects report 0.
+        let Some(ino) = objid_to_ino(id) else {
+            return Ok(0);
+        };
+        let mut fs = self.fs.lock().unwrap();
+        Ok(fs.get_inode(ino)?.mtime())
     }
 
     async fn len(&self, id: crate::ObjID) -> Result<u64> {
@@ -958,6 +1047,20 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         )?;
 
         let id = ino_to_objid(file.get_file_inode()?.num());
+        // Stamp a modification time on creation (and truncation, which is a content change): the
+        // image builder and lwext4 both leave inode times at 0, and mtime consumers (fingerprints)
+        // need created-later to sort later. Guest wall clock is boot-relative -- monotonic within
+        // a boot is the property that matters. An existing nonzero mtime is left alone.
+        if flags.contains(ExternalOpenFlags::CREATE) {
+            let mut ino = file.get_file_inode()?;
+            if ino.mtime() == 0 || flags.contains(ExternalOpenFlags::TRUNCATE) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                ino.set_mtime(now.max(1));
+            }
+        }
         // O_TRUNC frees blocks; O_CREAT can land on an inode ext4 recycled from a deleted file, so
         // either way any extents held under this id are now wrong. The ObjID is not known until the
         // open returns, hence the invalidation here rather than up front -- and hence a window
@@ -980,19 +1083,39 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             at,
             path.as_ref()
         );
-        // ObjID 1 is the external root (ino_to_objid(0)); anything else is unsupported here.
-        if at.is_some_and(|at| objid_to_ino(at) != Some(0)) {
-            return Err(ErrorKind::Unsupported.into());
+        // Resolve `at` exactly as open_external does, so a name that can be created in a
+        // directory can also be removed from it. This previously accepted only the external root
+        // and rejected every subdirectory as Unsupported -- but /sysroot is a real ext4
+        // subdirectory (the disk builder mkdirs it), so external unlink never worked anywhere a
+        // program actually writes.
+        let mut at_ino = if let Some(at) = at {
+            objid_to_ino(at).ok_or(ErrorKind::InvalidInput)?
+        } else {
+            2
+        };
+        if at_ino < 2 {
+            at_ino = 2;
         }
         let mut fs = self.fs.lock().unwrap();
         let name = path.as_ref().to_string_lossy();
+        // ext4_fremove refuses directories -- but returns the still-EOK `r` when it does, so a
+        // directory reaching it reports success while removing nothing. Before this change a
+        // subdirectory could not get here at all (the root-only check rejected it), so widening
+        // the check means this refusal now has to be explicit. External rmdir stays unimplemented
+        // (namerbugs.md); this keeps it an honest error rather than a silent no-op.
+        if matches!(
+            Self::child_kind(&mut fs, at_ino, name.as_ref()),
+            Some(FileKind::Directory)
+        ) {
+            return Err(ErrorKind::Unsupported.into());
+        }
         // Resolve the inode before unlinking: an external ObjID is derived from it, and both
         // caches are keyed on that ObjID. Leaving them populated is doubly wrong here, because
         // ext4 reuses inode numbers -- a later file can land on the same ObjID and inherit this
         // one's cached length. Best effort: a target we cannot open (a symlink, say) just leaves
         // the caches as they are today.
         let id = fs
-            .open_file(name.as_ref(), O_RDONLY)
+            .open_file_from_container(at_ino, name.as_ref(), O_RDONLY, 0)
             .ok()
             .and_then(|mut file| {
                 file.get_file_inode()
@@ -1006,7 +1129,13 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         } else {
             tracing::debug!("unlink_external: could not resolve inode for {:?}", name);
         }
-        fs.remove_file(name.as_ref())?;
+        // lwext4 exposes removal only as a path operation (ext4_fremove, which handles the
+        // truncate/unlink/free-inode sequence under one transaction), while everything else here
+        // is container-relative. Rather than reimplement that sequence against the raw bindings --
+        // a lot of unsafe on a path where a mistake corrupts the filesystem -- turn the container
+        // back into a path and reuse it.
+        let full = Self::path_of(&mut fs, at_ino, name.as_ref())?;
+        fs.remove_file(&full)?;
         return Ok(());
     }
 
