@@ -18,10 +18,7 @@ intervaltree = { workspace = true, features = ["serde"] }
 tracing = { workspace = true }
 lru = { workspace = true }
 lwext4-rs = { workspace = true }
-futures = { workspace = true }
 smallvec = { workspace = true }
-async-io = { workspace = true }
-async-executor = { workspace = true }
 bitflags = "*"
 libc = { workspace = true }
 

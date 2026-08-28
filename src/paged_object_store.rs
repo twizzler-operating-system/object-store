@@ -1,9 +1,8 @@
 #![allow(async_fn_in_trait)]
 pub type ObjID = u128;
 
-use std::{future::Future, io::ErrorKind, path::Path, thread::yield_now};
+use std::{io::ErrorKind, path::Path, thread::yield_now};
 
-use async_io::block_on;
 use libc::mode_t;
 pub use pager_dynamic::{
     ino_to_objid, objid_to_ino, ExternalFile, ExternalFileSbHdr, ExternalKind,
@@ -227,7 +226,7 @@ mod tests {
     }
 
     impl PagedDevice for MockDevice {
-        async fn phys_addrs(
+        fn phys_addrs(
             &self,
             _start_obj_page: i64,
             _nr_obj_pages: u32,
@@ -247,7 +246,7 @@ mod tests {
             Ok(())
         }
 
-        async fn sequential_read(
+        fn sequential_read(
             &self,
             _start: u64,
             nr_pages: usize,
@@ -265,7 +264,7 @@ mod tests {
             Ok(nr_pages.min(avail))
         }
 
-        async fn sequential_write(
+        fn sequential_write(
             &self,
             start: u64,
             nr_pages: usize,
@@ -273,10 +272,9 @@ mod tests {
             inner_cursor: usize,
         ) -> Result<usize> {
             self.sequential_read(start, nr_pages, list, inner_cursor)
-                .await
         }
 
-        async fn len(&self) -> Result<usize> {
+        fn len(&self) -> Result<usize> {
             Ok(self.alloc_pages * PAGE_SIZE)
         }
     }
@@ -291,7 +289,7 @@ mod tests {
             forced_tfer: None,
         };
         let mut req = PageRequest::new(0, 8);
-        let n = block_on(req.page_in(&[DevicePage::Run(100, 8)], &dev)).unwrap();
+        let n = req.page_in(&[DevicePage::Run(100, 8)], &dev).unwrap();
         assert_eq!(n, 4);
         assert_eq!(req.nr_pages, 4);
     }
@@ -304,8 +302,8 @@ mod tests {
             forced_tfer: None,
         };
         let mut req = PageRequest::new(0, 8);
-        block_on(req.setup_phys(&[DevicePage::Run(100, 8)], &dev)).unwrap();
-        let n = block_on(req.page_out(&[DevicePage::Run(100, 8)], &dev)).unwrap();
+        req.setup_phys(&[DevicePage::Run(100, 8)], &dev).unwrap();
+        let n = req.page_out(&[DevicePage::Run(100, 8)], &dev).unwrap();
         assert_eq!(n, 4);
     }
 
@@ -318,7 +316,7 @@ mod tests {
             forced_tfer: Some(0),
         };
         let mut req = PageRequest::new(0, 8);
-        assert!(block_on(req.page_in(&[DevicePage::Run(100, 8)], &dev)).is_err());
+        assert!(req.page_in(&[DevicePage::Run(100, 8)], &dev).is_err());
     }
 
     /// Entries no page landed in are dropped, not retained as zero-length ranges.
@@ -330,7 +328,7 @@ mod tests {
             forced_tfer: None,
         };
         let mut req = PageRequest::new(0, 2);
-        let n = block_on(req.page_in(&[DevicePage::Run(100, 2)], &dev)).unwrap();
+        let n = req.page_in(&[DevicePage::Run(100, 2)], &dev).unwrap();
         assert_eq!(n, 2);
         assert_eq!(req.phys_list.len(), 1);
         assert_eq!(req.nr_pages, 2);
@@ -340,7 +338,7 @@ mod tests {
 
 pub trait PagedDevice {
     /// Append the needed paged phys mem for this device page, return the number of appended pages.
-    async fn phys_addrs(
+    fn phys_addrs(
         &self,
         _start_obj_page: i64,
         _nr_obj_pages: u32,
@@ -350,16 +348,16 @@ pub trait PagedDevice {
         Err(std::io::ErrorKind::Unsupported.into())
     }
 
-    async fn free_phys_range(&self, _range: PhysRange) {}
+    fn free_phys_range(&self, _range: PhysRange) {}
 
-    async fn sequential_read(
+    fn sequential_read(
         &self,
         start: u64,
         nr_pages: usize,
         list: &[PagedPhysMem],
         inner_cursor: usize,
     ) -> Result<usize>;
-    async fn sequential_write(
+    fn sequential_write(
         &self,
         start: u64,
         nr_pages: usize,
@@ -367,14 +365,35 @@ pub trait PagedDevice {
         inner_cursor: usize,
     ) -> Result<usize>;
 
-    async fn len(&self) -> Result<usize>;
+    fn len(&self) -> Result<usize>;
 
     fn yield_now(&self) {
         yield_now();
     }
+}
 
-    fn run_async<R: 'static>(&self, f: impl Future<Output = R>) -> R {
-        block_on(f)
+/// Why a page-in cannot be served out of the store's caches alone -- i.e. why it would have to
+/// take the global fs lock, which is held across disk I/O.
+///
+/// Exists to split one number that was hiding three different problems. `Len` and `NoExtents` mean
+/// the store genuinely has to go to disk for this object. `Partial` does not: the extents are
+/// cached, just not far enough to cover the range as asked, and asking about a smaller range may
+/// well succeed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeMiss {
+    /// Everything needed is cached; serving this takes no fs lock.
+    Cached,
+    /// The object's length is not cached.
+    Len,
+    /// Nothing is cached about this object's block layout.
+    NoExtents,
+    /// Extents are cached, but do not span the range asked about.
+    Partial,
+}
+
+impl ProbeMiss {
+    pub fn would_block(&self) -> bool {
+        !matches!(self, ProbeMiss::Cached)
     }
 }
 
@@ -425,7 +444,7 @@ impl PageRequest {
         self.phys_list
     }
 
-    async fn setup_phys<PD: PagedDevice>(
+    fn setup_phys<PD: PagedDevice>(
         &mut self,
         disk_pages: &[DevicePage],
         device: &PD,
@@ -439,14 +458,12 @@ impl PageRequest {
         let nr_pages = disk_pages
             .iter()
             .fold(0usize, |acc, range| acc + range.nr_pages());
-        device
-            .phys_addrs(
-                self.start_page,
-                nr_pages as u32,
-                disk_pages,
-                &mut self.phys_list,
-            )
-            .await?;
+        device.phys_addrs(
+            self.start_page,
+            nr_pages as u32,
+            disk_pages,
+            &mut self.phys_list,
+        )?;
 
         // We may have allocated fewer pages, so recalculate nr_pages.
         self.nr_pages = self
@@ -490,13 +507,13 @@ impl PageRequest {
         (cursor, inner_cursor)
     }
 
-    pub async fn page_in<PD: PagedDevice>(
+    pub fn page_in<PD: PagedDevice>(
         &mut self,
         disk_pages: &[DevicePage],
         device: &PD,
     ) -> Result<usize> {
         let _time0 = std::time::Instant::now();
-        self.setup_phys(disk_pages, device).await?;
+        self.setup_phys(disk_pages, device)?;
         if self.phys_list.iter().all(|p| p.is_completed()) {
             return Ok(self.nr_pages as usize);
         }
@@ -538,7 +555,6 @@ impl PageRequest {
                                 &self.phys_list[cursor..],
                                 inner_cursor,
                             )
-                            .await
                             .inspect_err(|e| tracing::error!("read err: {}", e))?;
                         if r == 0 {
                             tracing::error!(
@@ -594,7 +610,7 @@ impl PageRequest {
                     start: range.range.start,
                     end: adj_range.start,
                 };
-                device.free_phys_range(adj_range).await;
+                device.free_phys_range(adj_range);
 
                 cursor += 1;
                 inner_cursor = 0;
@@ -616,7 +632,7 @@ impl PageRequest {
         Ok(tfer_count)
     }
 
-    pub async fn page_out<PD: PagedDevice>(
+    pub fn page_out<PD: PagedDevice>(
         &mut self,
         disk_pages: &[DevicePage],
         device: &PD,
@@ -662,7 +678,6 @@ impl PageRequest {
                                 &self.phys_list[cursor..],
                                 inner_cursor,
                             )
-                            .await
                             .inspect_err(|e| tracing::error!("write err: {}", e))?;
                         if r == 0 {
                             tracing::error!(
@@ -693,9 +708,9 @@ impl PageRequest {
 }
 
 pub trait PagedObjectStore {
-    async fn get_config_id(&self) -> Result<ObjID> {
+    fn get_config_id(&self) -> Result<ObjID> {
         let mut buf = [0; 16];
-        self.read_object(0, 0, &mut buf).await.and_then(|len| {
+        self.read_object(0, 0, &mut buf).and_then(|len| {
             if len == 16 && buf.iter().find(|x| **x != 0).is_some() {
                 Ok(ObjID::from_le_bytes(buf))
             } else {
@@ -704,24 +719,24 @@ pub trait PagedObjectStore {
         })
     }
 
-    async fn set_config_id(&self, id: ObjID) -> Result<()> {
-        let _ = self.delete_object(0).await;
-        self.create_object(0).await?;
-        self.write_object(0, 0, &id.to_le_bytes()).await
+    fn set_config_id(&self, id: ObjID) -> Result<()> {
+        let _ = self.delete_object(0);
+        self.create_object(0)?;
+        self.write_object(0, 0, &id.to_le_bytes())
     }
 
-    async fn create_object(&self, id: ObjID) -> Result<()>;
-    async fn delete_object(&self, id: ObjID) -> Result<()>;
+    fn create_object(&self, id: ObjID) -> Result<()>;
+    fn delete_object(&self, id: ObjID) -> Result<()>;
 
-    async fn len(&self, id: ObjID) -> Result<u64>;
+    fn len(&self, id: ObjID) -> Result<u64>;
 
     /// Store-recorded modification time (seconds) for `id`, or 0 when the backend keeps none.
-    async fn mtime(&self, _id: ObjID) -> Result<u32> {
+    fn mtime(&self, _id: ObjID) -> Result<u32> {
         Ok(0)
     }
 
-    async fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
-    async fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
+    fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
+    fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 
     /// Fill `out` with the device pages backing object pages `[start_page, start_page + nr_pages)`
     /// of `id`.
@@ -740,10 +755,10 @@ pub trait PagedObjectStore {
         out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> Result<()>;
 
-    async fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
-    async fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
 
-    async fn flush(&self) -> Result<()> {
+    fn flush(&self) -> Result<()> {
         Ok(())
     }
 }
@@ -759,7 +774,7 @@ bitflags::bitflags! {
 }
 
 pub trait ExternalFileStore {
-    async fn open_external(
+    fn open_external(
         &self,
         at: Option<ObjID>,
         path: impl AsRef<Path>,
@@ -768,10 +783,10 @@ pub trait ExternalFileStore {
         link_to: Option<ObjID>,
     ) -> Result<ExternalFile>;
 
-    async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;
-    async fn readlink_external(&self, id: ObjID) -> Result<String>;
+    fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;
+    fn readlink_external(&self, id: ObjID) -> Result<String>;
 
-    async fn readdir_external(
+    fn readdir_external(
         &self,
         dir: ObjID,
         skip: usize,
@@ -779,17 +794,17 @@ pub trait ExternalFileStore {
         entries: &mut std::vec::Vec<ExternalFile>,
     ) -> Result<()>;
 
-    async fn link_external(
+    fn link_external(
         &self,
         file: &ExternalFile,
         at: Option<ObjID>,
         path: impl AsRef<Path>,
     ) -> Result<()>;
 
-    async fn stat_external(&self, path: impl AsRef<Path>) -> Result<libc::stat>;
-    async fn fstat_external(&self, file: Option<ObjID>) -> Result<libc::stat>;
+    fn stat_external(&self, path: impl AsRef<Path>) -> Result<libc::stat>;
+    fn fstat_external(&self, file: Option<ObjID>) -> Result<libc::stat>;
 
-    async fn symlink_external(
+    fn symlink_external(
         &self,
         at: Option<ObjID>,
         target: impl AsRef<Path>,
@@ -798,6 +813,6 @@ pub trait ExternalFileStore {
 }
 
 pub trait PosIo {
-    async fn read(&self, start: u64, buf: &mut [u8]) -> Result<usize>;
-    async fn write(&self, start: u64, buf: &[u8]) -> Result<usize>;
+    fn read(&self, start: u64, buf: &mut [u8]) -> Result<usize>;
+    fn write(&self, start: u64, buf: &[u8]) -> Result<usize>;
 }

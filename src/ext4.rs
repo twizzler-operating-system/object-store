@@ -25,7 +25,7 @@ use crate::{
     extents::{push_device_page, ExtentTracker},
     paged_object_store::{Vec, INLINE_LEN},
     DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID, PagedDevice, PagedObjectStore, PosIo,
-    PAGE_SIZE,
+    ProbeMiss, PAGE_SIZE,
 };
 
 pub struct Ext4Store<D: Device> {
@@ -74,7 +74,7 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
-        let len = self.device.run_async(self.device.read(start, slice))?;
+        let len = self.device.read(start, slice)?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
@@ -90,7 +90,7 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
         }
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts(buf, len as usize) };
-        let len = self.device.run_async(self.device.write(start, slice))?;
+        let len = self.device.write(start, slice)?;
         Ok((len / PHYSICAL_BSIZE as usize) as u32)
     }
 
@@ -133,6 +133,25 @@ const BLOCKS_PER_LOCK: usize = 100;
 ///
 /// Read side only. Widening the ask under `create` would allocate blocks nobody asked for.
 const EXTENT_READAHEAD_BLOCKS: u32 = 4096;
+
+/// Pages a read-side walk continues *past* the request, to learn extents it will not emit.
+///
+/// [`EXTENT_READAHEAD_BLOCKS`] widens the block-map *ask*, but the walk loop still stops as soon as
+/// it has covered the request, so the only thing ever learned beyond it is the overhang of the last
+/// run -- roughly half an extent. That is enough to make the cache serve a *prefix* of the next
+/// request (measured: 90% of pages hit) and never enough to serve one whole (measured: 1 call in
+/// 128 avoided the fs lock, and 0 of 128 could be admitted to a fast lane). A demand fault asks
+/// about pages nobody has walked yet by definition, so a prefix hit is exactly the case that does
+/// not help it.
+///
+/// 512 pages is one large-page region -- the granularity `ensure_in_core_pager` widens a fault to,
+/// so it is the unit the *next* fault will ask about. Clamped to EOF, so a walk never learns holes
+/// past the end of a file it might later grow into.
+///
+/// Set to 0 to restore the old behaviour; that is the A/B arm. Judge it on `probe_partial` and
+/// `no-extents` in `LANESTATS`, not on fault counts -- an earlier cache-warming attempt was scored
+/// on faults, measured zero, and left the lock question unanswered (`pagerplan.md` stage 4).
+const EXTENT_WALK_AHEAD_PAGES: u64 = 512;
 
 /// Block index backing object page `page`. External files have no null page, so their object
 /// pages sit one block lower than an internal object's. Both paging paths and the page-out
@@ -200,6 +219,14 @@ struct ExtentStats {
     create_hit_pages: AtomicU64,
     create_walk_pages: AtomicU64,
     walk_lookups: AtomicU64,
+    /// Pages walked *past* the request purely to populate the cache, and the calls that did any.
+    ///
+    /// Split out because the plain `walk_pages` count is computed against the request's `end` and
+    /// therefore cannot see this work at all -- so widening the walk made the walk counter go
+    /// *down* (the later hits it bought are visible; its own cost is not). A speed-up whose cost
+    /// is invisible to the meter reporting it is not a measurement.
+    ahead_pages: AtomicU64,
+    ahead_calls: AtomicU64,
     calls: AtomicU64,
     /// Calls that found the object already carrying valid extents. Distinguishes "never revisited"
     /// from "revisited at a fresh range".
@@ -221,6 +248,8 @@ impl ExtentStats {
             create_hit_pages: AtomicU64::new(0),
             create_walk_pages: AtomicU64::new(0),
             walk_lookups: AtomicU64::new(0),
+            ahead_pages: AtomicU64::new(0),
+            ahead_calls: AtomicU64::new(0),
             calls: AtomicU64::new(0),
             warm_object_calls: AtomicU64::new(0),
             inflight: AtomicU64::new(0),
@@ -254,13 +283,15 @@ impl ExtentStats {
         let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if calls.is_power_of_two() {
             tracing::info!(
-                "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free",
+                "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof / {} walked-ahead in {} calls; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free",
                 calls,
                 self.warm_object_calls.load(Ordering::Relaxed),
                 self.walk_lookups.load(Ordering::Relaxed),
                 self.hit_pages.load(Ordering::Relaxed),
                 self.walk_pages.load(Ordering::Relaxed),
                 self.eof_pages.load(Ordering::Relaxed),
+                self.ahead_pages.load(Ordering::Relaxed),
+                self.ahead_calls.load(Ordering::Relaxed),
                 self.create_hit_pages.load(Ordering::Relaxed),
                 self.create_walk_pages.load(Ordering::Relaxed),
                 self.max_inflight.load(Ordering::Relaxed),
@@ -381,9 +412,9 @@ fn flush_fs(fs: &mut Ext4Fs) -> Result<()> {
 }
 
 impl<D: Device> Ext4Store<D> {
-    pub async fn new(device: D, name: &str) -> Result<Self> {
+    pub fn new(device: D, name: &str) -> Result<Self> {
         let bdname = format!("blockdev-{}", BDEV_ID.fetch_add(1, Ordering::SeqCst));
-        let max = device.len().await? as u64;
+        let max = device.len()? as u64;
         let bcount = max / LOGICAL_BSIZE as u64;
         let phys_bcount = max / PHYSICAL_BSIZE as u64;
         let bd = Ext4Blockdev::new(
@@ -444,16 +475,23 @@ impl<D: Device> Ext4Store<D> {
     /// they don't know -- being wrong in that direction only costs the caller its shortcut. The
     /// answer can also go stale between here and the work (an invalidation racing us), so this
     /// bounds how often a caller blocks rather than guaranteeing it never does.
-    pub fn page_in_would_block(&self, id: ObjID, start_page: u64, nr_pages: u32) -> bool {
+    /// Whether serving this range needs the fs lock, and if so which cache came up short.
+    ///
+    /// The reason is the point: a bare bool cannot distinguish "this object is unknown to us" from
+    /// "we know it, but not this far into it", and those want opposite fixes -- one needs the disk,
+    /// the other only needs to be asked about a smaller range.
+    pub fn page_in_would_block(&self, id: ObjID, start_page: u64, nr_pages: u32) -> ProbeMiss {
         if !self.len_is_cached(id) {
-            return true;
+            return ProbeMiss::Len;
         }
-        self.extents
-            .peek(id)
-            .is_none_or(|entry| !entry.covers(start_page, nr_pages))
+        match self.extents.peek(id) {
+            None => ProbeMiss::NoExtents,
+            Some(entry) if !entry.covers(start_page, nr_pages) => ProbeMiss::Partial,
+            Some(_) => ProbeMiss::Cached,
+        }
     }
 
-    async fn readlink(&self, id: ObjID) -> Result<String> {
+    fn readlink(&self, id: ObjID) -> Result<String> {
         // By inode rather than through `read_object`: a target short enough to live in the inode's
         // block map is stored there with no data block behind it, so reading one as file data
         // yields a block of unrelated bytes -- which, being zeros, is valid UTF-8 and passes for a
@@ -601,6 +639,24 @@ impl<D: Device> Ext4Store<D> {
         learned: &mut Vec<(u64, Option<u64>, u32), INLINE_LEN>,
         out: &mut Vec<DevicePage, INLINE_LEN>,
     ) -> Result<()> {
+        // How far to walk for *learning*, as opposed to how far to emit. Never past EOF, and never
+        // speculative under `create` -- widening an allocation walk would allocate blocks nobody
+        // asked for. An unknown length means no speculation at all rather than a guess.
+        let learn_end = if create || EXTENT_WALK_AHEAD_PAGES == 0 {
+            end
+        } else {
+            match self.get_len_from_cache(id) {
+                Some(Some(len)) => (end + EXTENT_WALK_AHEAD_PAGES)
+                    .min(len.div_ceil(PAGE_SIZE as u64))
+                    .max(end),
+                _ => end,
+            }
+        };
+
+        if learn_end > end {
+            EXTENT_STATS.ahead_calls.fetch_add(1, Ordering::Relaxed);
+        }
+
         let mut lookups = 0u64;
         let res = 'chunks: loop {
             let mut fs = self.fs.lock().unwrap();
@@ -614,14 +670,14 @@ impl<D: Device> Ext4Store<D> {
             };
 
             for _ in 0..BLOCKS_PER_LOCK {
-                if page >= end {
+                if page >= learn_end {
                     break 'chunks Ok(());
                 }
 
                 let block = page_to_block(id, page) as u32 * self.blocks_per_page;
-                let rem_blocks = (end - page) as u32 * self.blocks_per_page;
+                let rem_blocks = (learn_end - page) as u32 * self.blocks_per_page;
                 let ask = if create {
-                    rem_blocks
+                    (end - page) as u32 * self.blocks_per_page
                 } else {
                     rem_blocks.saturating_add(EXTENT_READAHEAD_BLOCKS)
                 };
@@ -655,15 +711,20 @@ impl<D: Device> Ext4Store<D> {
                 // Cache the whole run, but hand back only the pages asked for: the readahead
                 // exists to make the *next* request a hit, not to widen this transfer.
                 learned.push((page, pblock, nr_blocks));
-                let emit = nr_blocks.min(rem_blocks);
-                push_device_page(
-                    out,
-                    match pblock {
-                        Some(pblock) => DevicePage::Run(pblock, emit),
-                        None => DevicePage::Hole(emit),
-                    },
-                );
-                page += emit as u64;
+                // Emit only inside the request. Past `end` the walk is still learning -- those
+                // runs go into `learned` and nowhere else, or the caller would be handed pages it
+                // never asked for and has no physical memory for.
+                if page < end {
+                    let emit = nr_blocks.min((end - page) as u32 * self.blocks_per_page);
+                    push_device_page(
+                        out,
+                        match pblock {
+                            Some(pblock) => DevicePage::Run(pblock, emit),
+                            None => DevicePage::Hole(emit),
+                        },
+                    );
+                }
+                page += nr_blocks as u64;
             }
 
             drop(inode);
@@ -674,6 +735,11 @@ impl<D: Device> Ext4Store<D> {
         EXTENT_STATS
             .walk_lookups
             .fetch_add(lookups, Ordering::Relaxed);
+        // Whatever the walk covered beyond the request is work the `walk_pages` counter cannot
+        // see, since that is computed against `end`.
+        EXTENT_STATS
+            .ahead_pages
+            .fetch_add(page.saturating_sub(end), Ordering::Relaxed);
         res
     }
 
@@ -694,7 +760,7 @@ impl<D: Device> Ext4Store<D> {
 }
 
 impl<D: Device> PagedObjectStore for Ext4Store<D> {
-    async fn create_object(&self, id: crate::ObjID) -> Result<()> {
+    fn create_object(&self, id: crate::ObjID) -> Result<()> {
         // An id can be re-created after deletion, and an external id can land on a recycled inode.
         let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
@@ -704,11 +770,12 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let len = file.len();
         drop(file);
         self.set_len_in_cache(id, len);
-        flush_fs(&mut fs).inspect_err(|e| tracing::warn!("ext4 flush after create of {:x} failed: {}", id, e))?;
+        flush_fs(&mut fs)
+            .inspect_err(|e| tracing::warn!("ext4 flush after create of {:x} failed: {}", id, e))?;
         Ok(())
     }
 
-    async fn delete_object(&self, id: crate::ObjID) -> Result<()> {
+    fn delete_object(&self, id: crate::ObjID) -> Result<()> {
         if objid_to_ino(id).is_some() {
             // An inode-derived ID has no synthetic ids/xx/... path; unlinking one goes through
             // unlink_external. Say so rather than reporting a confusing NotFound.
@@ -727,7 +794,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(())
     }
 
-    async fn mtime(&self, id: crate::ObjID) -> Result<u32> {
+    fn mtime(&self, id: crate::ObjID) -> Result<u32> {
         // Only external (ino-backed) files carry a store mtime; native objects report 0.
         let Some(ino) = objid_to_ino(id) else {
             return Ok(0);
@@ -736,7 +803,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(fs.get_inode(ino)?.mtime())
     }
 
-    async fn len(&self, id: crate::ObjID) -> Result<u64> {
+    fn len(&self, id: crate::ObjID) -> Result<u64> {
         match self.get_len_from_cache(id) {
             Some(Some(len)) => return Ok(len),
             Some(None) => return Err(ErrorKind::NotFound.into()),
@@ -764,7 +831,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(len)
     }
 
-    async fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
+    fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
         let mut fs = self.fs.lock().unwrap();
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.seek(SeekFrom::Start(offset))?;
@@ -780,7 +847,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(total)
     }
 
-    async fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
+    fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
         // ext4_fwrite may allocate, and the ensure_backing/truncate pair below certainly does.
         let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.fs.lock().unwrap();
@@ -803,7 +870,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(())
     }
 
-    async fn flush(&self) -> Result<()> {
+    fn flush(&self) -> Result<()> {
         let mut fs = self.fs.lock().unwrap();
         Ok(fs.sync_super()?)
     }
@@ -865,11 +932,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         res
     }
 
-    async fn page_in_object<'a>(
-        &self,
-        id: ObjID,
-        reqs: &'a mut [crate::PageRequest],
-    ) -> Result<usize> {
+    fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
         tracing::trace!("paging  in request for {} reqs", reqs.len());
 
         let _time0 = Instant::now();
@@ -893,18 +956,14 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
             tracing::trace!("paging in {:?}", pages);
-            let _len = br.0.page_in(pages, &self.device).await?;
+            let _len = br.0.page_in(pages, &self.device)?;
         }
         PAGE_IN_STATS.record("page_in", _time1 - _time0, Instant::now() - _time1);
 
         Ok(reqs.len())
     }
 
-    async fn page_out_object<'a>(
-        &self,
-        id: ObjID,
-        reqs: &'a mut [crate::PageRequest],
-    ) -> Result<usize> {
+    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
         let end_offset = reqs
             .iter()
             .map(|req| req.start_page as u64 + req.nr_pages as u64)
@@ -930,7 +989,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             // then trim back to the exact length: the touched page is beyond the final size and
             // is never one the device-direct transfers below write, so the cached zeros cannot
             // race with them.
-            self.write_object(id, end_offset, &[0u8; PAGE_SIZE]).await?;
+            self.write_object(id, end_offset, &[0u8; PAGE_SIZE])?;
             self.set_len(id, end_offset)?;
         }
         tracing::trace!("paging out {:x} request for {} reqs", id, reqs.len());
@@ -964,7 +1023,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let blocks_found = Instant::now();
         for br in blocks.iter_mut() {
             let pages = &br.1[..];
-            let _len = br.0.page_out(pages, &self.device).await?;
+            let _len = br.0.page_out(pages, &self.device)?;
         }
         let mut fs = self.fs.lock().unwrap();
         flush_fs(&mut fs)?;
@@ -985,7 +1044,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
 }
 
 impl<D: Device> ExternalFileStore for Ext4Store<D> {
-    async fn open_external(
+    fn open_external(
         &self,
         at: Option<ObjID>,
         path: impl AsRef<Path>,
@@ -1077,7 +1136,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         ))
     }
 
-    async fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
+    fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()> {
         tracing::trace!(
             "unlinking external file at {:?} with path {:?}",
             at,
@@ -1139,11 +1198,11 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         return Ok(());
     }
 
-    async fn readlink_external(&self, at: ObjID) -> Result<String> {
-        self.readlink(at).await
+    fn readlink_external(&self, at: ObjID) -> Result<String> {
+        self.readlink(at)
     }
 
-    async fn readdir_external(
+    fn readdir_external(
         &self,
         dir: ObjID,
         skip: usize,
@@ -1214,7 +1273,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         Ok(())
     }
 
-    async fn link_external(
+    fn link_external(
         &self,
         _file: &ExternalFile,
         _at: Option<ObjID>,
@@ -1223,15 +1282,15 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         todo!()
     }
 
-    async fn stat_external(&self, _path: impl AsRef<Path>) -> Result<libc::stat> {
+    fn stat_external(&self, _path: impl AsRef<Path>) -> Result<libc::stat> {
         todo!()
     }
 
-    async fn fstat_external(&self, _file: Option<ObjID>) -> Result<libc::stat> {
+    fn fstat_external(&self, _file: Option<ObjID>) -> Result<libc::stat> {
         todo!()
     }
 
-    async fn symlink_external(
+    fn symlink_external(
         &self,
         _at: Option<ObjID>,
         _target: impl AsRef<Path>,
