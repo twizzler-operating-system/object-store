@@ -6,7 +6,7 @@ use std::{
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::Path,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Mutex, MutexGuard,
     },
     time::{Duration, Instant},
@@ -42,6 +42,187 @@ pub struct Ext4Store<D: Device> {
     device: D,
 }
 
+/// Contention and hold-time accounting for the one global `Ext4Store::fs` mutex.
+///
+/// Exists because the fast-lane reservation is about to stop asking "is this answerable from
+/// cache?" and start asking "is this lock busy?" -- and the safety of that trade rests entirely on
+/// how long the lock is held. `walk_block_map` drops and re-acquires every `BLOCKS_PER_LOCK`
+/// lookups, so the *intended* worst case is ~100 lookups rather than a whole transfer; nothing has
+/// ever measured whether that is what actually happens. `held` is the live count the dispatcher
+/// reads (a plain load, because it is consulted on the dequeue thread, which nothing may stall).
+/// Which call site took the fs lock. Only granular enough to answer the question that prompted
+/// it -- whether the hold-time tail comes from the block-map walk or from the one-shot metadata
+/// operations -- because a per-site breakdown nobody reads is just overhead.
+#[derive(Clone, Copy)]
+pub enum FsSite {
+    Walk = 0,
+    PageOut = 1,
+    ReadWrite = 2,
+    Meta = 3,
+    External = 4,
+    ExtReaddir = 5,
+    ExtUnlink = 6,
+}
+
+const FS_SITES: usize = 7;
+const FS_SITE_NAMES: [&str; FS_SITES] = [
+    "walk",
+    "page-out",
+    "read/write",
+    "meta",
+    "ext-open",
+    "ext-readdir",
+    "ext-unlink",
+];
+
+thread_local! {
+    /// Site whose critical section this thread is currently inside, so the block-device callbacks
+    /// -- which run under the fs lock on the calling thread, and have no argument to carry it --
+    /// can attribute their reads. Saved and restored rather than cleared, so a nested acquisition
+    /// cannot silently orphan its parent's attribution.
+    static CUR_SITE: core::cell::Cell<Option<FsSite>> = const { core::cell::Cell::new(None) };
+}
+
+fn note_bd_read() {
+    if let Some(site) = CUR_SITE.with(|c| c.get()) {
+        FS_LOCK_STATS.site_reads[site as usize].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub struct FsLockStats {
+    /// Inode-cache outcome for `get_object_as_file`. A hit is `open_file_from_inode`; a miss is a
+    /// full path lookup, i.e. directory traversal and the block reads that implies. Neither
+    /// `walk_lookups` nor `page_in` counts this path, so a regression that lives here is
+    /// invisible to every existing counter -- which is the situation that motivated it.
+    ino_hits: AtomicU64,
+    ino_misses: AtomicU64,
+    /// Block-device reads issued while this site held the lock. `FLUSHSTATS` already reports the
+    /// boot total; this says which call site asked for them, which is the part that identifies a
+    /// read-amplification regression rather than merely detecting one.
+    site_reads: [AtomicU64; FS_SITES],
+    site_holds: [AtomicU64; FS_SITES],
+    site_hold_ns: [AtomicU64; FS_SITES],
+    site_max_ns: [AtomicU64; FS_SITES],
+    held: AtomicUsize,
+    acquires: AtomicU64,
+    contended: AtomicU64,
+    hold_ns: AtomicU64,
+    hold_max_ns: AtomicU64,
+    wait_ns: AtomicU64,
+    wait_max_ns: AtomicU64,
+}
+
+pub static FS_LOCK_STATS: FsLockStats = FsLockStats {
+    ino_hits: AtomicU64::new(0),
+    ino_misses: AtomicU64::new(0),
+    site_reads: [const { AtomicU64::new(0) }; FS_SITES],
+    site_holds: [const { AtomicU64::new(0) }; FS_SITES],
+    site_hold_ns: [const { AtomicU64::new(0) }; FS_SITES],
+    site_max_ns: [const { AtomicU64::new(0) }; FS_SITES],
+    held: AtomicUsize::new(0),
+    acquires: AtomicU64::new(0),
+    contended: AtomicU64::new(0),
+    hold_ns: AtomicU64::new(0),
+    hold_max_ns: AtomicU64::new(0),
+    wait_ns: AtomicU64::new(0),
+    wait_max_ns: AtomicU64::new(0),
+};
+
+impl FsLockStats {
+    /// Whether anyone holds the fs lock right now. Advisory by nature -- it can change the
+    /// instant after it is read -- which is fine for an admission hint and would not be for a
+    /// correctness decision.
+    pub fn is_held(&self) -> bool {
+        self.held.load(Ordering::Relaxed) > 0
+    }
+
+    fn report(&self) {
+        let n = self.acquires.load(Ordering::Relaxed).max(1);
+        tracing::info!(
+            "FSLOCK: {} acquires, {} found it held ({}%); hold mean {} us max {} us; wait mean {} us max {} us",
+            self.acquires.load(Ordering::Relaxed),
+            self.contended.load(Ordering::Relaxed),
+            100 * self.contended.load(Ordering::Relaxed) / n,
+            self.hold_ns.load(Ordering::Relaxed) / n / 1000,
+            self.hold_max_ns.load(Ordering::Relaxed) / 1000,
+            self.wait_ns.load(Ordering::Relaxed) / n / 1000,
+            self.wait_max_ns.load(Ordering::Relaxed) / 1000,
+        );
+        let mut per_site = String::new();
+        for i in 0..FS_SITES {
+            let n = self.site_holds[i].load(Ordering::Relaxed);
+            if n == 0 {
+                continue;
+            }
+            per_site.push_str(&format!(
+                " {} n={} mean={}us max={}us bd-reads={};",
+                FS_SITE_NAMES[i],
+                n,
+                self.site_hold_ns[i].load(Ordering::Relaxed) / n / 1000,
+                self.site_max_ns[i].load(Ordering::Relaxed) / 1000,
+                self.site_reads[i].load(Ordering::Relaxed),
+            ));
+        }
+        let (h, m) = (
+            self.ino_hits.load(Ordering::Relaxed),
+            self.ino_misses.load(Ordering::Relaxed),
+        );
+        tracing::info!(
+            "FSLOCK-SITES:{} ino-cache {} hit / {} miss ({}% miss)",
+            per_site,
+            h,
+            m,
+            100 * m / (h + m).max(1),
+        );
+    }
+}
+
+fn bump_max(cell: &AtomicU64, v: u64) {
+    let mut cur = cell.load(Ordering::Relaxed);
+    while v > cur {
+        match cell.compare_exchange_weak(cur, v, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
+}
+
+/// A held `Ext4Store::fs`, timed. Derefs to the underlying `MutexGuard` so existing call sites
+/// that pass `&mut fs` into `get_object_as_file` keep working unchanged.
+pub struct FsGuard<'a> {
+    guard: MutexGuard<'a, Ext4Fs>,
+    since: Instant,
+    site: FsSite,
+    prev_site: Option<FsSite>,
+}
+
+impl<'a> std::ops::Deref for FsGuard<'a> {
+    type Target = MutexGuard<'a, Ext4Fs>;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<'a> std::ops::DerefMut for FsGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl Drop for FsGuard<'_> {
+    fn drop(&mut self) {
+        let held = self.since.elapsed().as_nanos() as u64;
+        let i = self.site as usize;
+        FS_LOCK_STATS.hold_ns.fetch_add(held, Ordering::Relaxed);
+        bump_max(&FS_LOCK_STATS.hold_max_ns, held);
+        FS_LOCK_STATS.site_holds[i].fetch_add(1, Ordering::Relaxed);
+        FS_LOCK_STATS.site_hold_ns[i].fetch_add(held, Ordering::Relaxed);
+        bump_max(&FS_LOCK_STATS.site_max_ns[i], held);
+        CUR_SITE.with(|c| c.set(self.prev_site));
+        FS_LOCK_STATS.held.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub trait Device: PosIo + PagedDevice + Sync + Send + Clone + 'static {}
 
 impl<T: PosIo + PagedDevice + Sync + Send + Clone + 'static> Device for T {}
@@ -71,6 +252,7 @@ impl<D: Device> Ext4BlockdevIface for Ext4Bd<D> {
 
     fn read(&mut self, buf: *mut u8, block: u64, bcount: u32) -> std::io::Result<u32> {
         BD_STATS.reads.fetch_add(1, Ordering::Relaxed);
+        note_bd_read();
         let start = block * PHYSICAL_BSIZE as u64;
         let len = bcount as u64 * PHYSICAL_BSIZE as u64;
         let slice = unsafe { core::slice::from_raw_parts_mut(buf, len as usize) };
@@ -121,6 +303,16 @@ const LOGICAL_BSIZE: u32 = 512;
 const PHYSICAL_BSIZE: u32 = 512;
 
 /// Block lookups performed per acquisition of the fs lock, between yields.
+///
+/// **Measured inert (2026-08-28).** Setting this to 16 changed nothing: the walk took exactly the
+/// same 105 acquisitions as at 100, because a walk covers ~63 pages per lookup and so finishes a
+/// request in well under either limit. The chunk bound never binds.
+///
+/// That matters because it retires an obvious-looking fix. The walk's hold-time tail is 4-12 ms
+/// (`FSLOCK-SITES`), and the natural reading -- "100 lookups, each possibly a disk read, so cap
+/// the count" -- is wrong: the tail is **one slow lookup**, not an accumulation of many. No value
+/// of this constant bounds it. Bounding the walk's hold means not holding `fs` across the
+/// block-map read, which is a restructure, not a tuning knob.
 const BLOCKS_PER_LOCK: usize = 100;
 
 /// Extra blocks a read-side walk asks about beyond the request.
@@ -148,10 +340,18 @@ const EXTENT_READAHEAD_BLOCKS: u32 = 4096;
 /// so it is the unit the *next* fault will ask about. Clamped to EOF, so a walk never learns holes
 /// past the end of a file it might later grow into.
 ///
-/// Set to 0 to restore the old behaviour; that is the A/B arm. Judge it on `probe_partial` and
-/// `no-extents` in `LANESTATS`, not on fault counts -- an earlier cache-warming attempt was scored
-/// on faults, measured zero, and left the lock question unanswered (`pagerplan.md` stage 4).
-const EXTENT_WALK_AHEAD_PAGES: u64 = 512;
+/// **Measured at 512 and reverted to 0.** It is nearly free -- ext4 returns long contiguous runs,
+/// so 71,514 pages were learned ahead in *fewer* block-map lookups than before (55 vs 57) -- and
+/// it bought nothing that matters: `probe_partial` 64 -> 63, fast-lane admissions 0 -> 0,
+/// fs-lock-free calls 1 -> 1. Learning 71k pages of extents moved request-level coverage by one
+/// request.
+///
+/// The suspected reason, unmeasured: `MAX_EXTENTS_PER_OBJECT` is 64 and the map *clears itself*
+/// on overflow, so a wider walk records more runs per call, trips the limit, and wipes the cache
+/// it was filling. If that is right the lever is the map's capacity and eviction policy, not the
+/// walk width -- and a counter on the clear path settles it. Until then this stays 0 rather than
+/// carrying speculative work whose benefit is measured and whose interaction is not.
+const EXTENT_WALK_AHEAD_PAGES: u64 = 0;
 
 /// Block index backing object page `page`. External files have no null page, so their object
 /// pages sit one block lower than an internal object's. Both paging paths and the page-out
@@ -219,6 +419,21 @@ struct ExtentStats {
     create_hit_pages: AtomicU64,
     create_walk_pages: AtomicU64,
     walk_lookups: AtomicU64,
+    /// Entries into `walk_block_map`, as opposed to `FSLOCK-SITES walk`, which counts the
+    /// per-`BLOCKS_PER_LOCK` chunk re-acquisitions inside it. Separated because the two moved
+    /// together under a change that touched neither -- identical lookups and pages walked, but
+    /// 67 acquisitions became 23 -- and one number cannot say whether the walk is entered less
+    /// often or merely chunks less often.
+    walk_calls: AtomicU64,
+    /// `readdir_external`: calls, dirents the iterator was advanced over (each one an inode read
+    /// inside `DirIter::next`), entries actually handed back, and the sum of `skip` requested.
+    /// Separated because the skip is applied *after* the inode-reading filter, so a paginated
+    /// enumeration re-reads every skipped entry -- and only these four numbers say whether that
+    /// costs a little or dominates.
+    rd_calls: AtomicU64,
+    rd_iterated: AtomicU64,
+    rd_returned: AtomicU64,
+    rd_skip: AtomicU64,
     /// Pages walked *past* the request purely to populate the cache, and the calls that did any.
     ///
     /// Split out because the plain `walk_pages` count is computed against the request's `end` and
@@ -248,6 +463,11 @@ impl ExtentStats {
             create_hit_pages: AtomicU64::new(0),
             create_walk_pages: AtomicU64::new(0),
             walk_lookups: AtomicU64::new(0),
+            walk_calls: AtomicU64::new(0),
+            rd_calls: AtomicU64::new(0),
+            rd_iterated: AtomicU64::new(0),
+            rd_returned: AtomicU64::new(0),
+            rd_skip: AtomicU64::new(0),
             ahead_pages: AtomicU64::new(0),
             ahead_calls: AtomicU64::new(0),
             calls: AtomicU64::new(0),
@@ -283,7 +503,7 @@ impl ExtentStats {
         let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         if calls.is_power_of_two() {
             tracing::info!(
-                "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof / {} walked-ahead in {} calls; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free",
+                "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof / {} walked-ahead in {} calls; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free; map overflow-clears {}; walk entered {}; readdir {} calls, {} dirents iterated, {} returned, {} skipped",
                 calls,
                 self.warm_object_calls.load(Ordering::Relaxed),
                 self.walk_lookups.load(Ordering::Relaxed),
@@ -296,6 +516,12 @@ impl ExtentStats {
                 self.create_walk_pages.load(Ordering::Relaxed),
                 self.max_inflight.load(Ordering::Relaxed),
                 self.max_cached_inflight.load(Ordering::Relaxed),
+                crate::extents::OVERFLOW_CLEARS.load(Ordering::Relaxed),
+                self.walk_calls.load(Ordering::Relaxed),
+                self.rd_calls.load(Ordering::Relaxed),
+                self.rd_iterated.load(Ordering::Relaxed),
+                self.rd_returned.load(Ordering::Relaxed),
+                self.rd_skip.load(Ordering::Relaxed),
             );
         }
     }
@@ -397,6 +623,10 @@ fn log_ext4_errno(op: &str, id: ObjID, e: std::io::Error) -> std::io::Error {
     e
 }
 
+/// Restore the old unconditional flush after every page-out. Kept as a switch rather than a
+/// deletion so the two can be A/B'd from one build; see the note at the page-out site.
+const PAGE_OUT_ALWAYS_FLUSH: bool = false;
+
 fn flush_fs(fs: &mut Ext4Fs) -> Result<()> {
     let r0 = BD_STATS.reads.load(Ordering::Relaxed);
     let w0 = BD_STATS.writes.load(Ordering::Relaxed);
@@ -497,7 +727,7 @@ impl<D: Device> Ext4Store<D> {
         // yields a block of unrelated bytes -- which, being zeros, is valid UTF-8 and passes for a
         // 4096-byte target rather than failing outright.
         let ino = objid_to_ino(id).ok_or(ErrorKind::InvalidInput)?;
-        let buf = self.fs.lock().unwrap().readlink_from_inode(ino)?;
+        let buf = self.lock_fs(FsSite::Meta).readlink_from_inode(ino)?;
         if buf.len() > PATH_MAX as usize {
             return Err(ErrorKind::InvalidData.into());
         }
@@ -526,7 +756,7 @@ impl<D: Device> Ext4Store<D> {
         // ftruncate frees blocks. The guard bumps on every exit path, so a `?` out of a
         // partially-applied truncate cannot leave stale extents behind.
         let _inval = self.extents.invalidate_on_drop(id);
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.truncate(len)?;
         self.set_len_in_cache(id, len);
@@ -555,8 +785,8 @@ impl<D: Device> Ext4Store<D> {
         let target = name.as_bytes();
         fs.dirents(&mut inode)
             .ok()?
-            .find(|(nm, _)| nm.as_slice() == target)
-            .and_then(|(_, iref)| iref.ok().map(|i| i.kind()))
+            .find(|(nm, _, _)| nm.as_slice() == target)
+            .map(|(_, _, kind)| kind)
     }
 
     /// Mount-relative path of `name` inside directory inode `dir_ino`.
@@ -579,16 +809,16 @@ impl<D: Device> Ext4Store<D> {
             let parent = {
                 let mut inode = fs.get_inode(ino)?;
                 fs.dirents(&mut inode)?
-                    .find(|(nm, _)| nm.as_slice() == b"..")
-                    .and_then(|(_, iref)| iref.ok().map(|i| i.num()))
+                    .find(|(nm, _, _)| nm.as_slice() == b"..")
+                    .map(|(_, ino, _)| ino)
                     .ok_or(ErrorKind::InvalidInput)?
             };
             let mut parent_inode = fs.get_inode(parent)?;
             let component = fs
                 .dirents(&mut parent_inode)?
-                .filter(|(nm, _)| nm.as_slice() != b"." && nm.as_slice() != b"..")
-                .find(|(_, iref)| iref.as_ref().is_ok_and(|i| i.num() == ino))
-                .map(|(nm, _)| nm)
+                .filter(|(nm, _, _)| nm.as_slice() != b"." && nm.as_slice() != b"..")
+                .find(|(_, dino, _)| *dino == ino)
+                .map(|(nm, _, _)| nm)
                 .ok_or(ErrorKind::InvalidInput)?;
             // ext4 names are arbitrary non-NUL bytes; one that is not UTF-8 cannot be spliced into
             // a path string, and a lossy conversion would name a different file.
@@ -608,7 +838,17 @@ impl<D: Device> Ext4Store<D> {
         id: ObjID,
         create: bool,
     ) -> std::io::Result<Ext4File<'a>> {
-        let flags = if create { O_RDWR | O_CREAT } else { O_RDWR };
+        // `create` implies truncate. The caller used to guarantee a clean object by unlinking it
+        // first and letting O_CREAT remake it, which cost a second full path lookup -- and for a
+        // fresh id that lookup could only ever fail. O_TRUNC gets the same guarantee from the one
+        // lookup we were already doing. It also reuses the inode instead of recycling one, which
+        // is strictly safer for any cached inode number; `open_external` above takes the same
+        // route for the same reason.
+        let flags = if create {
+            O_RDWR | O_CREAT | O_TRUNC
+        } else {
+            O_RDWR
+        };
         if let Some(ino) = objid_to_ino(id) {
             return fs.open_file_from_inode(ino, flags);
         }
@@ -657,9 +897,10 @@ impl<D: Device> Ext4Store<D> {
             EXTENT_STATS.ahead_calls.fetch_add(1, Ordering::Relaxed);
         }
 
+        EXTENT_STATS.walk_calls.fetch_add(1, Ordering::Relaxed);
         let mut lookups = 0u64;
         let res = 'chunks: loop {
-            let mut fs = self.fs.lock().unwrap();
+            let mut fs = self.lock_fs(FsSite::Walk);
             let mut file = match self.get_object_as_file(&mut fs, id, false) {
                 Ok(file) => file,
                 Err(e) => break Err(e.into()),
@@ -743,14 +984,55 @@ impl<D: Device> Ext4Store<D> {
         res
     }
 
+    /// Take the fs lock, timed, and count whether it was already held.
+    ///
+    /// Every acquisition in this file goes through here so `FS_LOCK_STATS` sees all of them; a
+    /// direct `self.fs.lock()` would be invisible to the meter and to the `held` count the
+    /// dispatcher reads.
+    fn lock_fs(&self, site: FsSite) -> FsGuard<'_> {
+        let contended = FS_LOCK_STATS.is_held();
+        let t0 = Instant::now();
+        let guard = self.fs.lock().unwrap();
+        let waited = t0.elapsed().as_nanos() as u64;
+        FS_LOCK_STATS.acquires.fetch_add(1, Ordering::Relaxed);
+        if contended {
+            FS_LOCK_STATS.contended.fetch_add(1, Ordering::Relaxed);
+        }
+        FS_LOCK_STATS.wait_ns.fetch_add(waited, Ordering::Relaxed);
+        bump_max(&FS_LOCK_STATS.wait_max_ns, waited);
+        FS_LOCK_STATS.held.fetch_add(1, Ordering::Relaxed);
+        let n = FS_LOCK_STATS.acquires.load(Ordering::Relaxed);
+        // Power-of-two alone truncates the tail by up to 2x, and asymmetrically between arms: a
+        // run ending at 500 acquisitions last reported at 256, while one ending at 520 reported
+        // at 512, so an A/B reads as "halved" when nothing changed. Report every 32 past 256 so
+        // the final figure is within 32 of the true total.
+        if n.is_power_of_two() || (n > 256 && n % 32 == 0) {
+            FS_LOCK_STATS.report();
+        }
+        let prev_site = CUR_SITE.with(|c| c.replace(Some(site)));
+        FsGuard {
+            guard,
+            since: Instant::now(),
+            site,
+            prev_site,
+        }
+    }
+
     pub fn get_object_as_file<'a>(
         &self,
         fs: &'a mut MutexGuard<'_, Ext4Fs>,
         id: ObjID,
         create: bool,
     ) -> std::io::Result<Ext4File<'a>> {
-        if let Some(ino) = self.lookup_ino_cache(id) {
-            return fs.open_file_from_inode(ino, O_RDWR);
+        // Only for opens, never for creates: this path opens by inode number and so cannot carry
+        // O_TRUNC, and silently returning an untruncated file would reintroduce exactly the stale
+        // contents the unlink used to prevent.
+        if !create {
+            if let Some(ino) = self.lookup_ino_cache(id) {
+                FS_LOCK_STATS.ino_hits.fetch_add(1, Ordering::Relaxed);
+                return fs.open_file_from_inode(ino, O_RDWR);
+            }
+            FS_LOCK_STATS.ino_misses.fetch_add(1, Ordering::Relaxed);
         }
         let mut file = self.do_get_object_as_file(fs, id, create)?;
         let ino = file.get_file_inode()?.num();
@@ -763,7 +1045,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     fn create_object(&self, id: crate::ObjID) -> Result<()> {
         // An id can be re-created after deletion, and an external id can land on a recycled inode.
         let _inval = self.extents.invalidate_on_drop(id);
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         let mut file = self
             .get_object_as_file(&mut fs, id, true)
             .map_err(|e| log_ext4_errno("create", id, e))?;
@@ -783,7 +1065,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         }
         let _inval = self.extents.invalidate_on_drop(id);
         let path = self.get_id_path(id);
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         // Drop the caches before checking the result: a failed remove must not leave them
         // pointing at an inode/length we can no longer trust.
         self.remove_ino_cache(id);
@@ -799,8 +1081,52 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         let Some(ino) = objid_to_ino(id) else {
             return Ok(0);
         };
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         Ok(fs.get_inode(ino)?.mtime())
+    }
+
+    /// One `FsSite::Meta` acquisition for both halves, rather than one per call.
+    fn len_and_mtime(&self, id: crate::ObjID) -> Result<(u64, u32)> {
+        let Some(ino) = objid_to_ino(id) else {
+            return Ok((self.len(id)?, 0));
+        };
+        // Consult the length cache before taking the fs lock, so a cache mutex is never nested
+        // inside a critical section held across disk I/O. (An earlier note here claimed the other
+        // order measured 11% worse hold time and pushed contention 25% -> 40%. That was withdrawn:
+        // the hold-time ranges overlapped at n=2, and the contention figure is a rate whose
+        // denominator this function shrinks, so it rises mechanically. The ordering is kept on
+        // principle, not on a measured win.)
+        let cached = self.get_len_from_cache(id);
+        if let Some(None) = cached {
+            return Err(ErrorKind::NotFound.into());
+        }
+        // One inode fetch, not two. `open_file_from_inode` already calls `get_inode` and stores its
+        // `size()` as the file's `fsize`, so opening the file to ask `len()` and then fetching the
+        // inode again for `mtime()` read the same inode twice per call. Both fields live on the
+        // `Ext4InodeRef`, so an external id needs no `Ext4File` at all.
+        //
+        // Why this and not fewer acquisitions: `meta` device reads were 884 in *both* arms of the
+        // two-acquisition A/B. Collapsing two acquisitions into one removed lock round trips and
+        // none of the work inside them, which is why that change moved no hold time. The work is
+        // these fetches.
+        let mut fs = self.lock_fs(FsSite::Meta);
+        match (cached, fs.get_inode(ino)) {
+            // Length already known: the inode is fetched solely for mtime.
+            (Some(Some(len)), Ok(inode)) => Ok((len, inode.mtime())),
+            // Inode unreadable but the length is cached. Preserves the previous shape, where mtime
+            // came from a separate call whose error both call sites folded to 0 rather than fail a
+            // lookup that had a length in hand.
+            (Some(Some(len)), Err(_)) => Ok((len, 0)),
+            (_, Ok(inode)) => {
+                let len = inode.size();
+                let mtime = inode.mtime();
+                drop(inode);
+                self.set_len_in_cache(id, len);
+                Ok((len, mtime))
+            }
+            // No cached length and no inode: nothing to report, so this is a real error.
+            (_, Err(e)) => Err(e.into()),
+        }
     }
 
     fn len(&self, id: crate::ObjID) -> Result<u64> {
@@ -809,7 +1135,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             Some(None) => return Err(ErrorKind::NotFound.into()),
             None => {}
         }
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         let mut file = match self.get_object_as_file(&mut fs, id, false) {
             Ok(file) => file,
             Err(e) => {
@@ -832,7 +1158,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     }
 
     fn read_object(&self, id: crate::ObjID, offset: u64, buf: &mut [u8]) -> Result<usize> {
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::ReadWrite);
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         file.seek(SeekFrom::Start(offset))?;
         // Deliberately not read_exact: callers (readlink) pass an oversized buffer and rely on
@@ -850,7 +1176,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     fn write_object(&self, id: crate::ObjID, offset: u64, buf: &[u8]) -> Result<()> {
         // ext4_fwrite may allocate, and the ensure_backing/truncate pair below certainly does.
         let _inval = self.extents.invalidate_on_drop(id);
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::ReadWrite);
         let mut file = self.get_object_as_file(&mut fs, id, false)?;
         if offset > file.len() {
             file.ensure_backing(offset)
@@ -871,7 +1197,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
     }
 
     fn flush(&self) -> Result<()> {
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::Meta);
         Ok(fs.sync_super()?)
     }
 
@@ -972,7 +1298,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
 
         let start = Instant::now();
         let needs_extend = {
-            let mut fs = self.fs.lock().unwrap();
+            let mut fs = self.lock_fs(FsSite::PageOut);
             let mut file = self.get_object_as_file(&mut fs, id, false)?;
             tracing::trace!(
                 "paging out request for {} reqs, end_offset = {:?}, len = {}",
@@ -1025,8 +1351,23 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             let pages = &br.1[..];
             let _len = br.0.page_out(pages, &self.device)?;
         }
-        let mut fs = self.fs.lock().unwrap();
-        flush_fs(&mut fs)?;
+        // The blocks above went straight to the device, bypassing ext4's cache, so ext4 holds no
+        // dirty state from them. What makes dropping this safe is write-through, not the
+        // condition below: `cache_write_back` is 0 and lwext4 brackets each of its own operations
+        // with write_back(1)..write_back(0), where the disable flushes the cache -- so the dirty
+        // list is already empty here. `needs_extend` is NOT a sufficient guard on its own; the
+        // allocating `get_disk_blocks(create=true)` above also dirties extent metadata, on a path
+        // where it is false. It is kept only because flushing in that case is the cheaper
+        // mistake. Measured: `flush`
+        // does 0.0 block reads and 0.0 block writes (lwext4 brackets its own operations and
+        // writes through when `cache_write_back` returns to 0), so the unconditional flush bought
+        // nothing and cost a second acquisition of the global fs lock on the pager's
+        // highest-frequency site -- ~28k acquisitions per boot against a lock with a 25 ms
+        // contended tail.
+        if PAGE_OUT_ALWAYS_FLUSH || needs_extend {
+            let mut fs = self.lock_fs(FsSite::PageOut);
+            flush_fs(&mut fs)?;
+        }
         let io_done = Instant::now();
         PAGE_OUT_STATS.record(
             "page_out",
@@ -1069,7 +1410,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             link_to
         );
 
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::External);
 
         let mut oflags = if flags.contains(ExternalOpenFlags::READ)
             && flags.contains(ExternalOpenFlags::WRITE)
@@ -1155,7 +1496,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         if at_ino < 2 {
             at_ino = 2;
         }
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::ExtUnlink);
         let name = path.as_ref().to_string_lossy();
         // ext4_fremove refuses directories -- but returns the still-EOK `r` when it does, so a
         // directory reaching it reports success while removing nothing. Before this change a
@@ -1216,7 +1557,7 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             skip,
             count
         );
-        let mut fs = self.fs.lock().unwrap();
+        let mut fs = self.lock_fs(FsSite::ExtReaddir);
         let mut inonr = objid_to_ino(dir).ok_or(ErrorKind::InvalidInput)?;
         if inonr == 0 {
             inonr = 2;
@@ -1228,37 +1569,46 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         // Filter first, then skip: `skip` counts entries the caller was actually handed, so a
         // dropped dirent does not desynchronize a cursor walking this namespace across calls. The
         // iterator reads each inode either way, so skipping later costs nothing.
+        EXTENT_STATS.rd_calls.fetch_add(1, Ordering::Relaxed);
+        EXTENT_STATS
+            .rd_skip
+            .fetch_add(skip as u64, Ordering::Relaxed);
         let diriter = diriter
-            .filter_map(|de| {
+            .inspect(|_| {
+                // Counted here rather than after the filter: `DirIter::next` reads the inode for
+                // every entry it yields, so this is the number of inode reads the call costs,
+                // including the ones `.skip()` below then discards.
+                EXTENT_STATS.rd_iterated.fetch_add(1, Ordering::Relaxed);
+            })
+            // An entry whose inode will not load is no longer dropped: nothing here reads inodes
+            // any more, so there is nothing to fail. That is deliberate and matches POSIX readdir,
+            // which does not stat -- a name present in the directory is a name, and hiding it makes
+            // a listing quietly incomplete exactly when you would most want to see it. A listed
+            // name that stats to nothing is this, working, not a new bug.
+            //
+            // Unverified for that case: as of 2026-08-29, no such entry had appeared in any
+            // recorded run -- the old code's drop-path warning matched 0 files under
+            // `target/results`, against 123,491 for a string known to be present, and 53
+            // object_store events reached the same log in one run, so the emit site existed, the
+            // channel worked and the query could match. Dated because a zero describes the moment
+            // it was taken: a corpus that later grows such an entry does not make this wrong, it
+            // makes it stale. Demonstrating the case needs a constructed entry --
+            // `debugfs -w -R "ln <unallocated-ino> name"` against a copy of the data image.
+            .filter_map(|(raw, ino, kind)| {
                 // ext4 names are arbitrary non-NUL bytes. A lossy conversion would not round-trip
                 // through a later lookup, so drop names we cannot represent.
-                let name = core::str::from_utf8(&de.0)
+                let name = core::str::from_utf8(&raw)
                     .inspect_err(|_| {
                         tracing::warn!("skipping non-utf8 dirent in namespace {:x}", dir)
                     })
                     .ok()?;
-                // A dirent whose inode will not load is data loss in a listing, so say so rather
-                // than dropping it silently.
-                let ino =
-                    de.1.inspect_err(|err| {
-                        tracing::warn!(
-                            "skipping dirent {} in namespace {:x}, no inode: {}",
-                            name,
-                            dir,
-                            err
-                        )
-                    })
-                    .ok()?;
-                Some(ExternalFile::new(
-                    name,
-                    ino.kind().into(),
-                    ino_to_objid(ino.num()),
-                ))
+                Some(ExternalFile::new(name, kind.into(), ino_to_objid(ino)))
             })
             .skip(skip)
             .take(count);
 
         for entry in diriter {
+            EXTENT_STATS.rd_returned.fetch_add(1, Ordering::Relaxed);
             tracing::trace!(
                 "record external file {} in namespace {:x} with ID {} and kind {:?}",
                 entry.name().unwrap_or("<invalid utf8>"),

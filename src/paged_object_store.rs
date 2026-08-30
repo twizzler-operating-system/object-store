@@ -735,6 +735,13 @@ pub trait PagedObjectStore {
         Ok(0)
     }
 
+    /// Length and mtime together. Every caller wants both, and a backend behind a global lock
+    /// otherwise pays two acquisitions for one answer. An unreadable mtime reports 0 rather than
+    /// failing the call, matching what the separate calls did at both call sites.
+    fn len_and_mtime(&self, id: ObjID) -> Result<(u64, u32)> {
+        Ok((self.len(id)?, self.mtime(id).unwrap_or(0)))
+    }
+
     fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
     fn write_object(&self, id: ObjID, offset: u64, buf: &[u8]) -> Result<()>;
 

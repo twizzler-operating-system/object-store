@@ -31,6 +31,9 @@ const MAX_TRACKED_OBJECTS: usize = 1024;
 /// without bound inside the process that manages memory pressure.
 const MAX_EXTENTS_PER_OBJECT: usize = 64;
 
+/// Times [`ExtentMap::insert`] hit the cap and threw the whole object's map away.
+pub static OVERFLOW_CLEARS: AtomicU64 = AtomicU64::new(0);
+
 /// Append `item` to `out`, merging it into the previous entry when the two are contiguous.
 pub fn push_device_page(out: &mut Vec<DevicePage, INLINE_LEN>, item: DevicePage) {
     if let Some(prev) = out.last_mut() {
@@ -190,6 +193,15 @@ impl ExtentMap {
         if self.runs.len() >= MAX_EXTENTS_PER_OBJECT {
             // Too fragmented to track. Start over rather than grow; the object simply stops
             // benefiting from the cache.
+            //
+            // Counted because this is a *destructive* overflow policy -- it discards everything
+            // known about the object, not the least useful entry -- and it is the leading
+            // suspicion for why widening the walk (EXTENT_WALK_AHEAD_PAGES) learned 71k pages and
+            // moved request-level coverage by one request: more runs per call trips this limit and
+            // wipes the cache the walk was filling. If this fires, the lever is the policy and the
+            // cap, not the walk width. If it never fires, that theory is dead and the walk-ahead
+            // failed for some other reason.
+            OVERFLOW_CLEARS.fetch_add(1, Ordering::Relaxed);
             self.runs.clear();
         }
 
