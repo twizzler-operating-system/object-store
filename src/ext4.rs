@@ -28,6 +28,15 @@ use crate::{
     ProbeMiss, PAGE_SIZE,
 };
 
+/// Whether the `pager` diagnostic class was requested via `TWZ_DIAG` (comma list, or `all`).
+/// Local copy of pager-srv's `watchdog::diag_enabled` — this crate is a dependency of pager-srv,
+/// not the other way around. Init logs the value at boot.
+fn diag_enabled() -> bool {
+    static SET: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let set = SET.get_or_init(|| std::env::var("TWZ_DIAG").unwrap_or_default());
+    set.split(',').any(|c| c == "pager" || c == "all")
+}
+
 pub struct Ext4Store<D: Device> {
     fs: Mutex<Ext4Fs>,
     ino_cache: Mutex<HashMap<ObjID, u32>>,
@@ -137,6 +146,9 @@ impl FsLockStats {
     }
 
     fn report(&self) {
+        if !diag_enabled() {
+            return;
+        }
         let n = self.acquires.load(Ordering::Relaxed).max(1);
         tracing::info!(
             "FSLOCK: {} acquires, {} found it held ({}%); hold mean {} us max {} us; wait mean {} us max {} us",
@@ -391,7 +403,7 @@ impl PageStats {
         let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
         // Power-of-two cadence: always reports regardless of total call count, while staying
         // sparse under load.
-        if calls.is_power_of_two() {
+        if calls.is_power_of_two() && diag_enabled() {
             tracing::info!(
                 "PAGESTATS {}: {} calls, collect {}ms, io {}ms",
                 what,
@@ -501,7 +513,7 @@ impl ExtentStats {
         walks.fetch_add(walked as u64, Ordering::Relaxed);
         self.eof_pages.fetch_add(past_eof as u64, Ordering::Relaxed);
         let calls = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if calls.is_power_of_two() {
+        if calls.is_power_of_two() && diag_enabled() {
             tracing::info!(
                 "EXTENTSTATS: {} calls ({} warm-object), {} lookups; read pages {} hit / {} walked / {} past-eof / {} walked-ahead in {} calls; create pages {} hit / {} walked; concurrency max {} in flight, max {} fs-lock-free; map overflow-clears {}; walk entered {}; readdir {} calls, {} dirents iterated, {} returned, {} skipped",
                 calls,
@@ -584,7 +596,7 @@ impl BdStats {
         self.flush_reads.fetch_add(reads, Ordering::Relaxed);
         self.flush_writes.fetch_add(writes, Ordering::Relaxed);
         let n = self.flushes.fetch_add(1, Ordering::Relaxed) + 1;
-        if n.is_power_of_two() {
+        if n.is_power_of_two() && diag_enabled() {
             tracing::info!(
                 "FLUSHSTATS: {} flushes, {}ms in flush; per flush: {:.1} bd-reads, {:.1} bd-writes;                  {} sb-writes; totals: {} bd-reads, {} bd-writes, {}KB written",
                 n,
@@ -780,13 +792,103 @@ impl<D: Device> Ext4Store<D> {
     /// Read from the parent's dirents rather than by opening the child: opening a directory or a
     /// symlink does not necessarily succeed, and the caller needs the answer precisely for the
     /// cases an open would not give it.
-    fn child_kind(fs: &mut MutexGuard<'_, Ext4Fs>, dir_ino: u32, name: &str) -> Option<FileKind> {
+    /// The `(inode, kind)` of `name` inside directory `dir_ino`, from the dirent alone.
+    fn child_entry(
+        fs: &mut MutexGuard<'_, Ext4Fs>,
+        dir_ino: u32,
+        name: &str,
+    ) -> Option<(u32, FileKind)> {
         let mut inode = fs.get_inode(dir_ino).ok()?;
         let target = name.as_bytes();
         fs.dirents(&mut inode)
             .ok()?
             .find(|(nm, _, _)| nm.as_slice() == target)
-            .map(|(_, _, kind)| kind)
+            .map(|(_, ino, kind)| (ino, kind))
+    }
+
+    /// Remove `name` from directory `at_ino`, with the cache/extent invalidation removal
+    /// requires. The caller holds the fs lock; shared by `unlink_external` and the
+    /// replace-on-link path in `open_external`.
+    ///
+    /// Files only. ext4_fremove refuses directories -- but returns the still-EOK `r` when it does,
+    /// so a directory reaching it reports success while removing nothing. Callers that mean to
+    /// remove a directory dispatch to `rmdir_child_locked` themselves; the refusal stays here
+    /// because the replace-on-link path must *not* silently rmdir a rename destination.
+    fn unlink_child_locked(
+        &self,
+        fs: &mut MutexGuard<'_, Ext4Fs>,
+        at_ino: u32,
+        name: &str,
+    ) -> Result<()> {
+        if matches!(
+            Self::child_entry(fs, at_ino, name),
+            Some((_, FileKind::Directory))
+        ) {
+            return Err(ErrorKind::Unsupported.into());
+        }
+        // Resolve the inode before unlinking: an external ObjID is derived from it, and both
+        // caches are keyed on that ObjID. Leaving them populated is doubly wrong here, because
+        // ext4 reuses inode numbers -- a later file can land on the same ObjID and inherit this
+        // one's cached length. Best effort: a target we cannot open (a symlink, say) just leaves
+        // the caches as they are today.
+        let id = fs
+            .open_file_from_container(at_ino, name, O_RDONLY, 0)
+            .ok()
+            .and_then(|mut file| {
+                file.get_file_inode()
+                    .ok()
+                    .map(|ino| ino_to_objid(ino.num()))
+            });
+        let _inval = id.map(|id| self.extents.invalidate_on_drop(id));
+        if let Some(id) = id {
+            self.remove_ino_cache(id);
+            self.invalidate_len(id);
+        } else {
+            tracing::debug!(
+                "unlink_child_locked: could not resolve inode for {:?}",
+                name
+            );
+        }
+        // lwext4 exposes removal only as a path operation (ext4_fremove, which handles the
+        // truncate/unlink/free-inode sequence under one transaction), while everything else here
+        // is container-relative. Rather than reimplement that sequence against the raw bindings --
+        // a lot of unsafe on a path where a mistake corrupts the filesystem -- turn the container
+        // back into a path and reuse it.
+        let full = Self::path_of(fs, at_ino, name)?;
+        fs.remove_file(&full)?;
+        Ok(())
+    }
+
+    /// Remove directory `name` (inode `dir_ino`) from directory `at_ino`.
+    ///
+    /// Empty-only, POSIX rmdir semantics: `ext4_dir_rm` deletes the whole subtree, and a caller
+    /// that asked to remove one name must not lose everything under it. `remove_dir_all` in libstd
+    /// empties the directory itself before getting here, so nothing is lost by refusing.
+    fn rmdir_child_locked(
+        &self,
+        fs: &mut MutexGuard<'_, Ext4Fs>,
+        at_ino: u32,
+        dir_ino: u32,
+        name: &str,
+    ) -> Result<()> {
+        let empty = {
+            let mut inode = fs.get_inode(dir_ino)?;
+            fs.dirents(&mut inode)?
+                .all(|(nm, _, _)| nm.as_slice() == b"." || nm.as_slice() == b"..")
+        };
+        if !empty {
+            return Err(ErrorKind::DirectoryNotEmpty.into());
+        }
+        // Same reasoning as the file path below: the external ObjID is derived from the inode
+        // number, ext4 reuses inode numbers, and a later file landing on this one would inherit
+        // whatever these caches still hold for it.
+        let id = ino_to_objid(dir_ino);
+        let _inval = self.extents.invalidate_on_drop(id);
+        self.remove_ino_cache(id);
+        self.invalidate_len(id);
+        let full = Self::path_of(fs, at_ino, name)?;
+        fs.remove_dir(&full)?;
+        Ok(())
     }
 
     /// Mount-relative path of `name` inside directory inode `dir_ino`.
@@ -1082,13 +1184,35 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
             return Ok(0);
         };
         let mut fs = self.lock_fs(FsSite::Meta);
-        Ok(fs.get_inode(ino)?.mtime())
+        // Floor to 1: the image builder leaves inode times at 0, and mtime consumers (neatvi's
+        // no-clobber check, `find_meta_ext`) read 0 as "no such file"/"no such ext". An existing
+        // file must never report 0.
+        Ok(fs.get_inode(ino)?.mtime().max(1))
     }
 
-    /// One `FsSite::Meta` acquisition for both halves, rather than one per call.
-    fn len_and_mtime(&self, id: crate::ObjID) -> Result<(u64, u32)> {
+    fn set_mtime(&self, id: crate::ObjID, mtime: u32) -> Result<()> {
         let Some(ino) = objid_to_ino(id) else {
-            return Ok((self.len(id)?, 0));
+            return Err(ErrorKind::Unsupported.into());
+        };
+        let mut fs = self.lock_fs(FsSite::Meta);
+        fs.get_inode(ino)?.set_mtime(mtime.max(1));
+        Ok(())
+    }
+
+    fn nlink(&self, id: crate::ObjID) -> Result<u32> {
+        // Only external (ino-backed) files can have more than one name: an internal object is
+        // reachable through the single `ids/` entry this store keeps for it.
+        let Some(ino) = objid_to_ino(id) else {
+            return Ok(1);
+        };
+        let mut fs = self.lock_fs(FsSite::Meta);
+        Ok(fs.get_inode(ino)?.links_count().max(1) as u32)
+    }
+
+    /// One `FsSite::Meta` acquisition for all three, rather than one per call.
+    fn len_mtime_nlink(&self, id: crate::ObjID) -> Result<(u64, u32, u32)> {
+        let Some(ino) = objid_to_ino(id) else {
+            return Ok((self.len(id)?, 0, 1));
         };
         // Consult the length cache before taking the fs lock, so a cache mutex is never nested
         // inside a critical section held across disk I/O. (An earlier note here claimed the other
@@ -1102,27 +1226,31 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         }
         // One inode fetch, not two. `open_file_from_inode` already calls `get_inode` and stores its
         // `size()` as the file's `fsize`, so opening the file to ask `len()` and then fetching the
-        // inode again for `mtime()` read the same inode twice per call. Both fields live on the
-        // `Ext4InodeRef`, so an external id needs no `Ext4File` at all.
+        // inode again for `mtime()` read the same inode twice per call. All three fields live on
+        // the `Ext4InodeRef`, so an external id needs no `Ext4File` at all.
         //
         // Why this and not fewer acquisitions: `meta` device reads were 884 in *both* arms of the
         // two-acquisition A/B. Collapsing two acquisitions into one removed lock round trips and
         // none of the work inside them, which is why that change moved no hold time. The work is
         // these fetches.
         let mut fs = self.lock_fs(FsSite::Meta);
+        // mtimes floored to 1, matching `mtime()`: an existing file must never report 0.
         match (cached, fs.get_inode(ino)) {
-            // Length already known: the inode is fetched solely for mtime.
-            (Some(Some(len)), Ok(inode)) => Ok((len, inode.mtime())),
+            // Length already known: the inode is fetched solely for mtime and link count.
+            (Some(Some(len)), Ok(inode)) => {
+                Ok((len, inode.mtime().max(1), inode.links_count().max(1) as u32))
+            }
             // Inode unreadable but the length is cached. Preserves the previous shape, where mtime
             // came from a separate call whose error both call sites folded to 0 rather than fail a
             // lookup that had a length in hand.
-            (Some(Some(len)), Err(_)) => Ok((len, 0)),
+            (Some(Some(len)), Err(_)) => Ok((len, 1, 1)),
             (_, Ok(inode)) => {
                 let len = inode.size();
-                let mtime = inode.mtime();
+                let mtime = inode.mtime().max(1);
+                let nlink = inode.links_count().max(1) as u32;
                 drop(inode);
                 self.set_len_in_cache(id, len);
-                Ok((len, mtime))
+                Ok((len, mtime, nlink))
             }
             // No cached length and no inode: nothing to report, so this is a real error.
             (_, Err(e)) => Err(e.into()),
@@ -1431,12 +1559,24 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         }
 
         if let Some(link_to) = link_to {
-            fs.link(
-                path.as_ref().to_string_lossy().as_ref(),
-                at_ino,
-                objid_to_ino(link_to).ok_or(ErrorKind::InvalidInput)?,
-            )
-            .inspect_err(|e| tracing::warn!("failed to link: {}", e))?;
+            let target_ino = objid_to_ino(link_to).ok_or(ErrorKind::InvalidInput)?;
+            let name = path.as_ref().to_string_lossy();
+            // This is how rename lands (ExtNamespace::replace), and POSIX rename overwrites --
+            // but lwext4's low-level link never checks for an existing entry:
+            // ext4_dir_add_entry appends a second dirent under the same name, and later lookups
+            // can keep resolving to the replaced inode. Drop the destination first, under this
+            // same fs lock. A destination already pointing at the target is left alone, since
+            // unlinking could free the inode's last link before the re-link.
+            match Self::child_entry(&mut fs, at_ino, name.as_ref()) {
+                Some((ino, _)) if ino == target_ino => {}
+                existing => {
+                    if existing.is_some() {
+                        self.unlink_child_locked(&mut fs, at_ino, name.as_ref())?;
+                    }
+                    fs.link(name.as_ref(), at_ino, target_ino)
+                        .inspect_err(|e| tracing::warn!("failed to link: {}", e))?;
+                }
+            }
         }
 
         let mut file = fs.open_file_from_container(
@@ -1498,45 +1638,14 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         }
         let mut fs = self.lock_fs(FsSite::ExtUnlink);
         let name = path.as_ref().to_string_lossy();
-        // ext4_fremove refuses directories -- but returns the still-EOK `r` when it does, so a
-        // directory reaching it reports success while removing nothing. Before this change a
-        // subdirectory could not get here at all (the root-only check rejected it), so widening
-        // the check means this refusal now has to be explicit. External rmdir stays unimplemented
-        // (namerbugs.md); this keeps it an honest error rather than a silent no-op.
-        if matches!(
-            Self::child_kind(&mut fs, at_ino, name.as_ref()),
-            Some(FileKind::Directory)
-        ) {
-            return Err(ErrorKind::Unsupported.into());
+        // One entry point for both, because the naming layer has one: `remove` does not know
+        // which kind it is about to drop, and neither does the `remove_file`/`remove_dir` pair
+        // in libstd once it reaches the runtime.
+        if let Some((ino, FileKind::Directory)) = Self::child_entry(&mut fs, at_ino, name.as_ref())
+        {
+            return self.rmdir_child_locked(&mut fs, at_ino, ino, name.as_ref());
         }
-        // Resolve the inode before unlinking: an external ObjID is derived from it, and both
-        // caches are keyed on that ObjID. Leaving them populated is doubly wrong here, because
-        // ext4 reuses inode numbers -- a later file can land on the same ObjID and inherit this
-        // one's cached length. Best effort: a target we cannot open (a symlink, say) just leaves
-        // the caches as they are today.
-        let id = fs
-            .open_file_from_container(at_ino, name.as_ref(), O_RDONLY, 0)
-            .ok()
-            .and_then(|mut file| {
-                file.get_file_inode()
-                    .ok()
-                    .map(|ino| ino_to_objid(ino.num()))
-            });
-        let _inval = id.map(|id| self.extents.invalidate_on_drop(id));
-        if let Some(id) = id {
-            self.remove_ino_cache(id);
-            self.invalidate_len(id);
-        } else {
-            tracing::debug!("unlink_external: could not resolve inode for {:?}", name);
-        }
-        // lwext4 exposes removal only as a path operation (ext4_fremove, which handles the
-        // truncate/unlink/free-inode sequence under one transaction), while everything else here
-        // is container-relative. Rather than reimplement that sequence against the raw bindings --
-        // a lot of unsafe on a path where a mistake corrupts the filesystem -- turn the container
-        // back into a path and reuse it.
-        let full = Self::path_of(&mut fs, at_ino, name.as_ref())?;
-        fs.remove_file(&full)?;
-        return Ok(());
+        self.unlink_child_locked(&mut fs, at_ino, name.as_ref())
     }
 
     fn readlink_external(&self, at: ObjID) -> Result<String> {

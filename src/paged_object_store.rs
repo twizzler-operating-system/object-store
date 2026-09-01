@@ -735,11 +735,26 @@ pub trait PagedObjectStore {
         Ok(0)
     }
 
-    /// Length and mtime together. Every caller wants both, and a backend behind a global lock
-    /// otherwise pays two acquisitions for one answer. An unreadable mtime reports 0 rather than
-    /// failing the call, matching what the separate calls did at both call sites.
-    fn len_and_mtime(&self, id: ObjID) -> Result<(u64, u32)> {
-        Ok((self.len(id)?, self.mtime(id).unwrap_or(0)))
+    /// Record a modification time (seconds) for `id`, for backends that keep one.
+    fn set_mtime(&self, _id: ObjID, _mtime: u32) -> Result<()> {
+        Err(ErrorKind::Unsupported.into())
+    }
+
+    /// Hard link count for `id`, for backends that keep one. Backends with no notion of multiple
+    /// names for one object report 1, which is what an object reachable by exactly one name has.
+    fn nlink(&self, _id: ObjID) -> Result<u32> {
+        Ok(1)
+    }
+
+    /// Length, mtime and link count together. Every caller wants all three, and a backend behind a
+    /// global lock otherwise pays an acquisition apiece for one answer. An unreadable mtime reports
+    /// 0 and an unreadable link count 1, rather than failing the call.
+    fn len_mtime_nlink(&self, id: ObjID) -> Result<(u64, u32, u32)> {
+        Ok((
+            self.len(id)?,
+            self.mtime(id).unwrap_or(0),
+            self.nlink(id).unwrap_or(1),
+        ))
     }
 
     fn read_object(&self, id: ObjID, offset: u64, buf: &mut [u8]) -> Result<usize>;
