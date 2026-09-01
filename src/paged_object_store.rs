@@ -806,6 +806,18 @@ pub trait ExternalFileStore {
     ) -> Result<ExternalFile>;
 
     fn unlink_external(&self, at: Option<ObjID>, path: impl AsRef<Path>) -> Result<()>;
+
+    /// Rebind `old` in `at` to `new` in `to`, as one operation.
+    ///
+    /// Deliberately not expressible as link-then-unlink: for a directory that sequence frees the
+    /// inode while the new name still refers to it (see `Ext4Store::rename_external`).
+    fn rename_external(
+        &self,
+        at: Option<ObjID>,
+        old: impl AsRef<Path>,
+        to: Option<ObjID>,
+        new: impl AsRef<Path>,
+    ) -> Result<()>;
     fn readlink_external(&self, id: ObjID) -> Result<String>;
 
     fn readdir_external(

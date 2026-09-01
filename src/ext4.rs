@@ -71,9 +71,10 @@ pub enum FsSite {
     External = 4,
     ExtReaddir = 5,
     ExtUnlink = 6,
+    ExtRename = 7,
 }
 
-const FS_SITES: usize = 7;
+const FS_SITES: usize = 8;
 const FS_SITE_NAMES: [&str; FS_SITES] = [
     "walk",
     "page-out",
@@ -82,6 +83,7 @@ const FS_SITE_NAMES: [&str; FS_SITES] = [
     "ext-open",
     "ext-readdir",
     "ext-unlink",
+    "ext-rename",
 ];
 
 thread_local! {
@@ -882,6 +884,9 @@ impl<D: Device> Ext4Store<D> {
         // Same reasoning as the file path below: the external ObjID is derived from the inode
         // number, ext4 reuses inode numbers, and a later file landing on this one would inherit
         // whatever these caches still hold for it.
+        if diag_enabled() {
+            tracing::info!("rmdir '{}' ino {} from parent ino {}", name, dir_ino, at_ino);
+        }
         let id = ino_to_objid(dir_ino);
         let _inval = self.extents.invalidate_on_drop(id);
         self.remove_ino_cache(id);
@@ -906,25 +911,72 @@ impl<D: Device> Ext4Store<D> {
         let mut ino = dir_ino;
         while ino != ROOT_INO {
             if parts.len() >= MAX_DEPTH {
+                tracing::warn!("path_of({}, {}): depth limit at ino {}", dir_ino, name, ino);
                 return Err(ErrorKind::InvalidInput.into());
             }
             let parent = {
                 let mut inode = fs.get_inode(ino)?;
-                fs.dirents(&mut inode)?
+                match fs
+                    .dirents(&mut inode)?
                     .find(|(nm, _, _)| nm.as_slice() == b"..")
                     .map(|(_, ino, _)| ino)
-                    .ok_or(ErrorKind::InvalidInput)?
+                {
+                    Some(parent) => parent,
+                    None => {
+                        tracing::warn!("path_of({}, {}): ino {} has no `..`", dir_ino, name, ino);
+                        return Err(ErrorKind::InvalidInput.into());
+                    }
+                }
             };
             let mut parent_inode = fs.get_inode(parent)?;
-            let component = fs
+            // Bound to a local so the iterator's borrow of `parent_inode` ends here: the failure
+            // arm below needs to walk the same directory again.
+            let found = fs
                 .dirents(&mut parent_inode)?
                 .filter(|(nm, _, _)| nm.as_slice() != b"." && nm.as_slice() != b"..")
                 .find(|(_, dino, _)| *dino == ino)
-                .map(|(nm, _, _)| nm)
-                .ok_or(ErrorKind::InvalidInput)?;
+                .map(|(nm, _, _)| nm);
+            let component = match found {
+                Some(component) => component,
+                None => {
+                    // Dump what the parent does hold: a same-named entry pointing at a different
+                    // inode says the name was re-linked and this inode orphaned, which is a very
+                    // different bug from the entry simply being absent.
+                    let listing: std::vec::Vec<(String, u32)> = fs
+                        .dirents(&mut parent_inode)
+                        .map(|it| {
+                            it.map(|(nm, i, _)| (String::from_utf8_lossy(&nm).into_owned(), i))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        "path_of({}, {}): ino {} not listed in parent {}; resolved so far {:?}; \
+                         parent holds {:?}",
+                        dir_ino,
+                        name,
+                        ino,
+                        parent,
+                        parts,
+                        listing
+                    );
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+            };
             // ext4 names are arbitrary non-NUL bytes; one that is not UTF-8 cannot be spliced into
             // a path string, and a lossy conversion would name a different file.
-            parts.push(String::from_utf8(component).map_err(|_| ErrorKind::InvalidInput)?);
+            match String::from_utf8(component) {
+                Ok(component) => parts.push(component),
+                Err(e) => {
+                    tracing::warn!(
+                        "path_of({}, {}): ino {} has a non-UTF-8 name {:?}",
+                        dir_ino,
+                        name,
+                        ino,
+                        e.as_bytes()
+                    );
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+            }
             ino = parent;
         }
         parts.reverse();
@@ -1078,11 +1130,16 @@ impl<D: Device> Ext4Store<D> {
         EXTENT_STATS
             .walk_lookups
             .fetch_add(lookups, Ordering::Relaxed);
-        // Whatever the walk covered beyond the request is work the `walk_pages` counter cannot
-        // see, since that is computed against `end`.
-        EXTENT_STATS
-            .ahead_pages
-            .fetch_add(page.saturating_sub(end), Ordering::Relaxed);
+        // Only when the readahead policy actually widened the walk. `page` overshoots `end`
+        // routinely without any speculation -- `get_data_blocks` returns whole runs, and a run
+        // that extends past the request carries the walk past `end` for free. Counting that as
+        // walk-ahead attributed the extent mechanism's own overshoot to a policy that had not
+        // run, and read as "231234 pages walked-ahead in 0 calls": a cost with no cause.
+        if learn_end > end {
+            EXTENT_STATS
+                .ahead_pages
+                .fetch_add(page.saturating_sub(end), Ordering::Relaxed);
+        }
         res
     }
 
@@ -1587,6 +1644,16 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         )?;
 
         let id = ino_to_objid(file.get_file_inode()?.num());
+        // Directories only: low volume, and enough to pair a later stale `..` with the create
+        // that set it and the rmdir that invalidated it.
+        if mode & libc::S_IFMT == libc::S_IFDIR && diag_enabled() {
+            tracing::info!(
+                "created dir '{}' ino {} in parent ino {}",
+                path.as_ref().display(),
+                objid_to_ino(id).unwrap_or(0),
+                at_ino
+            );
+        }
         // Stamp a modification time on creation (and truncation, which is a content change): the
         // image builder and lwext4 both leave inode times at 0, and mtime consumers (fingerprints)
         // need created-later to sort later. Guest wall clock is boot-relative -- monotonic within
@@ -1629,7 +1696,13 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
         // subdirectory (the disk builder mkdirs it), so external unlink never worked anywhere a
         // program actually writes.
         let mut at_ino = if let Some(at) = at {
-            objid_to_ino(at).ok_or(ErrorKind::InvalidInput)?
+            match objid_to_ino(at) {
+                Some(ino) => ino,
+                None => {
+                    tracing::warn!("unlink_external: {:x} is not an external id", at);
+                    return Err(ErrorKind::InvalidInput.into());
+                }
+            }
         } else {
             2
         };
@@ -1646,6 +1719,52 @@ impl<D: Device> ExternalFileStore for Ext4Store<D> {
             return self.rmdir_child_locked(&mut fs, at_ino, ino, name.as_ref());
         }
         self.unlink_child_locked(&mut fs, at_ino, name.as_ref())
+    }
+
+    fn rename_external(
+        &self,
+        at: Option<ObjID>,
+        old: impl AsRef<Path>,
+        to: Option<ObjID>,
+        new: impl AsRef<Path>,
+    ) -> Result<()> {
+        let resolve = |id: Option<ObjID>| -> Result<u32> {
+            let Some(id) = id else { return Ok(2) };
+            match objid_to_ino(id) {
+                // The root is reachable as either 0 or 2 through this mapping.
+                Some(ino) if ino >= 2 => Ok(ino),
+                Some(_) => Ok(2),
+                None => {
+                    tracing::warn!("rename_external: {:x} is not an external id", id);
+                    Err(ErrorKind::InvalidInput.into())
+                }
+            }
+        };
+        let at_ino = resolve(at)?;
+        let to_ino = resolve(to)?;
+
+        let mut fs = self.lock_fs(FsSite::ExtRename);
+        let old_name = old.as_ref().to_string_lossy();
+        let new_name = new.as_ref().to_string_lossy();
+
+        // POSIX rename replaces the destination; `ext4_frename` refuses one
+        // (`ext4_create_hardlink` returns EEXIST), so drop it first. Never a directory: the
+        // naming layer refuses to clobber a namespace, and doing it here would discard a tree.
+        // `unlink_child_locked` also drops the caches keyed on the victim's ObjID, which matters
+        // because that ObjID is derived from an inode number ext4 will hand out again.
+        if let Some((_, kind)) = Self::child_entry(&mut fs, to_ino, new_name.as_ref()) {
+            if matches!(kind, FileKind::Directory) {
+                return Err(ErrorKind::AlreadyExists.into());
+            }
+            self.unlink_child_locked(&mut fs, to_ino, new_name.as_ref())?;
+        }
+
+        // `ext4_frename` takes paths, like the removal path does, and for the same reason: the
+        // container-relative primitives cannot express the whole operation atomically.
+        let old_path = Self::path_of(&mut fs, at_ino, old_name.as_ref())?;
+        let new_path = Self::path_of(&mut fs, to_ino, new_name.as_ref())?;
+        fs.frename(&old_path, &new_path)?;
+        Ok(())
     }
 
     fn readlink_external(&self, at: ObjID) -> Result<String> {
