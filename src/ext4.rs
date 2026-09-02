@@ -1163,9 +1163,16 @@ impl<D: Device> Ext4Store<D> {
         let n = FS_LOCK_STATS.acquires.load(Ordering::Relaxed);
         // Power-of-two alone truncates the tail by up to 2x, and asymmetrically between arms: a
         // run ending at 500 acquisitions last reported at 256, while one ending at 520 reported
-        // at 512, so an A/B reads as "halved" when nothing changed. Report every 32 past 256 so
-        // the final figure is within 32 of the true total.
-        if n.is_power_of_two() || (n > 256 && n % 32 == 0) {
+        // at 512, so an A/B reads as "halved" when nothing changed. Hence a fixed cadence past
+        // 256 as well.
+        //
+        // The cadence was 32, which is inside the window `PAGESTATS page_in` times: `report()`
+        // runs under `lock_fs`, `lock_fs` runs inside `walk_block_map`, and `walk_block_map`
+        // runs inside the timed `collect`. A tracetest build emitted 1941 report pairs (~1.3 MB
+        // of console), enough that the print alone could account for the whole 5.9 s `collect`
+        // charged at smp1 -- the instrument was most of what it measured. 2048 keeps the final
+        // figure within 3% of the true total and costs ~30 prints instead of ~1941.
+        if n.is_power_of_two() || (n > 256 && n % 2048 == 0) {
             FS_LOCK_STATS.report();
         }
         let prev_site = CUR_SITE.with(|c| c.replace(Some(site)));
@@ -1474,34 +1481,52 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         Ok(reqs.len())
     }
 
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [crate::PageRequest]) -> Result<usize> {
-        let end_offset = reqs
-            .iter()
-            .map(|req| req.start_page as u64 + req.nr_pages as u64)
-            .max()
-            .map(|end_page| page_to_block(id, end_page) * PAGE_SIZE as u64);
+    fn page_out_object<'a>(
+        &self,
+        id: ObjID,
+        reqs: &'a mut [crate::PageRequest],
+        true_len: Option<u64>,
+    ) -> Result<usize> {
+        // The page requests only bound the length from above: they end at a page boundary, so
+        // using them grows i_size by up to PAGE-1 bytes past the real end. That over-estimate used
+        // to win, because the caller sets the authoritative length from `MEXT_SIZED` *before*
+        // paging out and this then grew it again -- a 7383464-byte file came back as 7385088
+        // (1803 pages) with a zero tail. Prefer the real length whenever the caller has one.
+        let end_offset = true_len.or_else(|| {
+            reqs.iter()
+                .map(|req| req.start_page as u64 + req.nr_pages as u64)
+                .max()
+                .map(|end_page| page_to_block(id, end_page) * PAGE_SIZE as u64)
+        });
 
         let start = Instant::now();
+        // i_size has to cover the pages about to be written, and `ext4_ftruncate` only shrinks
+        // (it returns EOK untouched when `fsize <= size`). Growing it used to mean writing a zero
+        // page *past* the end and truncating back: three fs-lock acquisitions, a buffered page
+        // write with its own block allocation, and a truncate that freed it again. Measured at
+        // 695-916 us mean over ~866 calls -- the largest single fs-lock hold in a build.
+        //
+        // `ext4_fclose` only resets the in-memory `ext4_file`; it never writes `f->fsize` back,
+        // so the length left stale in `file` here cannot clobber the inode on drop.
         let needs_extend = {
             let mut fs = self.lock_fs(FsSite::PageOut);
             let mut file = self.get_object_as_file(&mut fs, id, false)?;
+            let end_offset = end_offset.unwrap_or(0);
             tracing::trace!(
                 "paging out request for {} reqs, end_offset = {:?}, len = {}",
                 reqs.len(),
                 end_offset,
                 file.len()
             );
-            end_offset.unwrap_or(0) > file.len()
+            if end_offset > file.len() {
+                file.get_file_inode()?.set_size(end_offset);
+                true
+            } else {
+                false
+            }
         };
         if needs_extend {
-            let end_offset = end_offset.unwrap_or(0);
-            // i_size has to cover the pages about to be written, but lwext4's truncate only
-            // shrinks, so growth has to come from a write. Write one page *past* the end and
-            // then trim back to the exact length: the touched page is beyond the final size and
-            // is never one the device-direct transfers below write, so the cached zeros cannot
-            // race with them.
-            self.write_object(id, end_offset, &[0u8; PAGE_SIZE])?;
-            self.set_len(id, end_offset)?;
+            self.set_len_in_cache(id, end_offset.unwrap_or(0));
         }
         tracing::trace!("paging out {:x} request for {} reqs", id, reqs.len());
 

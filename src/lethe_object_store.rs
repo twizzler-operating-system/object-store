@@ -559,6 +559,7 @@ where
         &self,
         _id: crate::ObjID,
         _reqs: &'a [crate::PageRequest],
+        _true_len: Option<u64>,
     ) -> Result<usize> {
         todo!()
     }

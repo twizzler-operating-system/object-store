@@ -778,7 +778,15 @@ pub trait PagedObjectStore {
     ) -> Result<()>;
 
     fn page_in_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
-    fn page_out_object<'a>(&self, id: ObjID, reqs: &'a mut [PageRequest]) -> Result<usize>;
+    /// Write pages back. `true_len`, when the caller knows it, is the object's authoritative
+    /// length from `MEXT_SIZED` -- it must win over anything derivable from the page requests,
+    /// which are page-granular and so only ever an over-estimate.
+    fn page_out_object<'a>(
+        &self,
+        id: ObjID,
+        reqs: &'a mut [PageRequest],
+        true_len: Option<u64>,
+    ) -> Result<usize>;
 
     fn flush(&self) -> Result<()> {
         Ok(())
