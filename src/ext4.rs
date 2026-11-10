@@ -22,6 +22,7 @@ use pager_dynamic::{ino_to_objid, objid_to_ino, ExternalFile};
 use twizzler::Result;
 
 use crate::{
+    PhysRange,
     extents::{push_device_page, ExtentTracker},
     paged_object_store::{Vec, INLINE_LEN},
     DevicePage, ExternalFileStore, ExternalOpenFlags, ObjID, PagedDevice, PagedObjectStore, PosIo,
@@ -107,6 +108,8 @@ pub struct FsLockStats {
     /// invisible to every existing counter -- which is the situation that motivated it.
     ino_hits: AtomicU64,
     ino_misses: AtomicU64,
+    /// Page-out extend checks that took the fs lock to read `i_size`.
+    extend_locked: AtomicU64,
     /// Block-device reads issued while this site held the lock. `FLUSHSTATS` already reports the
     /// boot total; this says which call site asked for them, which is the part that identifies a
     /// read-amplification regression rather than merely detecting one.
@@ -125,6 +128,7 @@ pub struct FsLockStats {
 
 pub static FS_LOCK_STATS: FsLockStats = FsLockStats {
     ino_hits: AtomicU64::new(0),
+    extend_locked: AtomicU64::new(0),
     ino_misses: AtomicU64::new(0),
     site_reads: [const { AtomicU64::new(0) }; FS_SITES],
     site_holds: [const { AtomicU64::new(0) }; FS_SITES],
@@ -182,11 +186,12 @@ impl FsLockStats {
             self.ino_misses.load(Ordering::Relaxed),
         );
         tracing::info!(
-            "FSLOCK-SITES:{} ino-cache {} hit / {} miss ({}% miss)",
+            "FSLOCK-SITES:{} ino-cache {} hit / {} miss ({}% miss); page-out extend checks {}",
             per_site,
             h,
             m,
             100 * m / (h + m).max(1),
+            self.extend_locked.load(Ordering::Relaxed),
         );
     }
 }
@@ -370,6 +375,33 @@ const EXTENT_WALK_AHEAD_PAGES: u64 = 0;
 /// Block index backing object page `page`. External files have no null page, so their object
 /// pages sit one block lower than an internal object's. Both paging paths and the page-out
 /// file-extension check go through here so they cannot disagree about the mapping.
+/// Cut `req` down to the object pages below `limit_page`, dropping the rest.
+fn trim_past_eof(req: &mut crate::PageRequest, limit_page: u64) {
+    let start = req.start_page.max(0) as u64;
+    let keep = limit_page.saturating_sub(start).min(req.nr_pages as u64) as usize;
+    if keep == req.nr_pages as usize {
+        return;
+    }
+    let mut left = keep;
+    let mut entries = 0;
+    for pm in req.phys_list.iter_mut() {
+        if left == 0 {
+            break;
+        }
+        let n = pm.nr_pages();
+        if n > left {
+            pm.range = PhysRange::new(
+                pm.range.start,
+                pm.range.start + (left * PAGE_SIZE) as u64,
+            );
+        }
+        left -= n.min(left);
+        entries += 1;
+    }
+    req.phys_list.truncate(entries);
+    req.nr_pages = keep as u32;
+}
+
 fn page_to_block(id: ObjID, page: u64) -> u64 {
     if objid_to_ino(id).is_some() && page > 0 {
         page - 1
@@ -637,10 +669,6 @@ fn log_ext4_errno(op: &str, id: ObjID, e: std::io::Error) -> std::io::Error {
     e
 }
 
-/// Restore the old unconditional flush after every page-out. Kept as a switch rather than a
-/// deletion so the two can be A/B'd from one build; see the note at the page-out site.
-const PAGE_OUT_ALWAYS_FLUSH: bool = false;
-
 fn flush_fs(fs: &mut Ext4Fs) -> Result<()> {
     let r0 = BD_STATS.reads.load(Ordering::Relaxed);
     let w0 = BD_STATS.writes.load(Ordering::Relaxed);
@@ -771,8 +799,21 @@ impl<D: Device> Ext4Store<D> {
         // partially-applied truncate cannot leave stale extents behind.
         let _inval = self.extents.invalidate_on_drop(id);
         let mut fs = self.lock_fs(FsSite::Meta);
-        let mut file = self.get_object_as_file(&mut fs, id, false)?;
-        file.truncate(len)?;
+        // `ext4_ftruncate` only shrinks (EOK, untouched, when the file is already shorter), so a
+        // truncate-extend has to move i_size itself, the way page-out does.
+        let grew = {
+            let mut file = self.get_object_as_file(&mut fs, id, false)?;
+            if len > file.len() {
+                file.get_file_inode()?.set_size(len);
+                true
+            } else {
+                file.truncate(len)?;
+                false
+            }
+        };
+        if grew {
+            flush_fs(&mut fs)?;
+        }
         self.set_len_in_cache(id, len);
         Ok(())
     }
@@ -1499,6 +1540,17 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
                 .map(|end_page| page_to_block(id, end_page) * PAGE_SIZE as u64)
         });
 
+        // Pages at or past the true length are the kernel's zero-fill-past-EOF pages: born dirty,
+        // never written to. Writing them allocated blocks past i_size that the caller's `set_len`
+        // then truncated away again -- 16 blocks per 18-byte file -- and the last of those blocks
+        // survived the truncate, which is what e2fsck reports. Drop them here instead.
+        if let Some(len) = true_len {
+            let limit = len.div_ceil(PAGE_SIZE as u64) + u64::from(objid_to_ino(id).is_some());
+            for req in reqs.iter_mut() {
+                trim_past_eof(req, limit);
+            }
+        }
+
         let start = Instant::now();
         // i_size has to cover the pages about to be written, and `ext4_ftruncate` only shrinks
         // (it returns EOK untouched when `fsize <= size`). Growing it used to mean writing a zero
@@ -1508,25 +1560,40 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         //
         // `ext4_fclose` only resets the in-memory `ext4_file`; it never writes `f->fsize` back,
         // so the length left stale in `file` here cannot clobber the inode on drop.
+        // Only the "already long enough" answer is taken from the cache, and only when it is
+        // positively known. That direction is the safe one: believing a cached length that is too
+        // LARGE would skip a needed extend and leave the write past `i_size`, so an unknown length
+        // still takes the lock. Every `i_size` mutation in this file either re-sets the entry
+        // (`set_len`, `write_object`, `create_object`, and the extend below) or invalidates it
+        // (the unlink paths), so a positive entry cannot be stale high.
+        //
+        // Same ordering the read path already uses deliberately -- `len_mtime_nlink` and
+        // `get_disk_blocks` both consult the cache ahead of `lock_fs` -- which the write path
+        // never got. The lock is global and held across NVMe round trips, so an acquisition taken
+        // only to evaluate a comparison is worth removing.
+        let end = end_offset.unwrap_or(0);
+        // Always read `i_size` under the lock rather than trusting the length cache: `set_size`
+        // does not persist reliably, so the cache can claim a length the store never kept, and a
+        // skipped extend leaves the written blocks past `i_size`.
         let needs_extend = {
+            FS_LOCK_STATS.extend_locked.fetch_add(1, Ordering::Relaxed);
             let mut fs = self.lock_fs(FsSite::PageOut);
             let mut file = self.get_object_as_file(&mut fs, id, false)?;
-            let end_offset = end_offset.unwrap_or(0);
             tracing::trace!(
                 "paging out request for {} reqs, end_offset = {:?}, len = {}",
                 reqs.len(),
-                end_offset,
+                end,
                 file.len()
             );
-            if end_offset > file.len() {
-                file.get_file_inode()?.set_size(end_offset);
+            if end > file.len() {
+                file.get_file_inode()?.set_size(end);
                 true
             } else {
                 false
             }
         };
         if needs_extend {
-            self.set_len_in_cache(id, end_offset.unwrap_or(0));
+            self.set_len_in_cache(id, end);
         }
         tracing::trace!("paging out {:x} request for {} reqs", id, reqs.len());
 
@@ -1574,7 +1641,7 @@ impl<D: Device> PagedObjectStore for Ext4Store<D> {
         // nothing and cost a second acquisition of the global fs lock on the pager's
         // highest-frequency site -- ~28k acquisitions per boot against a lock with a 25 ms
         // contended tail.
-        if PAGE_OUT_ALWAYS_FLUSH || needs_extend {
+        if needs_extend {
             let mut fs = self.lock_fs(FsSite::PageOut);
             flush_fs(&mut fs)?;
         }
